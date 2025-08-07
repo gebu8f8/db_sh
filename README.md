@@ -26,6 +26,6 @@
 - 🔄 自我更新: 內建腳本更新功能，隨時保持最新版本。
 # 安裝
 ```
-bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/db/dba.sh)
+bash <(curl -sL https://raw.githubusercontent.com/gebu8f8/db_sh/refs/heads/main/dba.sh)
 ```
 **以後的命令即可用dba訪問**
