@@ -1427,7 +1427,7 @@ show_mysql_info() {
 }
 
 update_script() {
-  local download_url="https://gitlab.com/gebu8f/sh/-/raw/main/db/dba.sh"
+  local download_url="https://raw.githubusercontent.com/gebu8f8/db_sh/refs/heads/main/dba.sh"
   local temp_path="/tmp/dba.sh"
   local current_script="/usr/local/bin/dba"
   local current_path="$0"
