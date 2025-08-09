@@ -7,7 +7,7 @@ YELLOW='\033[1;33m'  # 警告用黃色
 CYAN='\033[0;36m'    # 一般提示用青色
 RESET='\033[0m'      # 清除顏色
 
-version="3.0.0"
+version="3.1.0"
 
 # 檢查是否以root權限運行
 if [ "$(id -u)" -ne 0 ]; then
@@ -1205,13 +1205,16 @@ uninstall_database(){
 
 install_database(){
   local type=$1
+  local cli_mode=${2:-false}
   case $type in
   mysql)
     if command -v mysql >/dev/null 2>&1 || command -v mariadb >/dev/null 2>&1; then
-      echo -e "${GREEN}已安裝MariaDB/MySQL。${RESET}"
-      exec dbx mysql
+      echo -e "${GREEN}已安裝MariaDB/MySQL。${RESET}" >&2
+      if [ $cli_mode == false ]; then
+        exec dba mysql
+      fi
     else
-      echo -e "${YELLOW}未安裝MariaDB/MySQL。${RESET}"
+      echo -e "${YELLOW}未安裝MariaDB/MySQL。${RESET}" >&2
       if [ $system -eq 1 ]; then
         apt install -y curl gnupg lsb-release
         curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | sudo bash -s -- --mariadb-server-version="10.11"
@@ -1230,15 +1233,19 @@ install_database(){
         mysql_install_db --user=mysql --basedir=/usr --datadir=/var/lib/mysql
         service mariadb start
       fi
-      exec dbx mysql
+      if [ $cli_mode == false ]; then
+        exec dba mysql
+      fi
     fi
     ;;
   pgsql)
     if command -v pgsql >/dev/null 2>&1; then
-      echo -e "${GREEN}已安裝PostgreSQL。${RESET}"
-      exec dbx pgsql
+      echo -e "${GREEN}已安裝PostgreSQL。${RESET}" >&2
+      if [ $cli_mode == false ]; then
+        exec dbx pgsql
+      fi
     else
-      echo -e "${YELLOW}未安裝PostgreSQL。${RESET}"
+      echo -e "${YELLOW}未安裝PostgreSQL。${RESET}" >&2
       if [ $system -eq 1 ]; then
         if ! command -v gpg >/dev/null 2>&1; then
           apt install -y gpg
@@ -1280,8 +1287,10 @@ install_database(){
         rc-update add postgresql default
         rc-service postgresql start
       fi
-      echo -e "${GREEN}PostgreSQL 已安裝完成。${RESET}"
-      exec dbx pgsql
+      echo -e "${GREEN}PostgreSQL 已安裝完成。${RESET}" >&2
+      if [ $cli_mode == false ]; then
+        exec dbx pgsql
+      fi
     fi
     ;;
   esac
@@ -1637,17 +1646,18 @@ case "$1" in
   mysql)
     case "$2" in
     install)
-      install_database mysql
+      cil_mode=true
+      install_database mysql $c 
       ;;
     add)
       check_mysql
-      cil_mode=true
+      cli_mode=true
       dbname=$3
       dbuser=$4
       skip=$5
       [[ "$skip" == "--force" ]] && skip=y
       pass=${6:-$(openssl rand -base64 12 | tr -dc 'A-Za-z0-9')}
-      create_database "$dbname" "$dbuser" "$pass" "$skip" $cil_mode 
+      create_database "$dbname" "$dbuser" "$pass" "$skip" $cli_mode 
       echo $pass
       exit 
       ;;
@@ -1676,17 +1686,18 @@ case "$1" in
   pgsql)
     case $2 in
     install)
-      install_database pgsql
+      cli_mode=true
+      install_database pgsql $cli_mode
       ;;
     add)
       check_pgsql
-      cil_mode=true
+      cli_mode=true
       dbname=$3
       dbuser=$4
       nat=$5
       [[ "$nat" == "true" || "$nat" == "yes" ]] && nat=y
       pass=${6:-$(openssl rand -base64 12 | tr -dc 'A-Za-z0-9')}
-      create_database "$dbname" "$dbuser" "$pass" "$nat" $cil_mode 
+      create_database "$dbname" "$dbuser" "$pass" "$nat" $cli_mode 
       echo $pass
       exit 
       ;;
