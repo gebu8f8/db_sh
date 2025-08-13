@@ -7,7 +7,7 @@ YELLOW='\033[1;33m'  # 警告用黃色
 CYAN='\033[0;36m'    # 一般提示用青色
 RESET='\033[0m'      # 清除顏色
 
-version="3.1.0"
+version="3.1.1"
 
 # 檢查是否以root權限運行
 if [ "$(id -u)" -ne 0 ]; then
@@ -1206,6 +1206,7 @@ uninstall_database(){
 install_database(){
   local type=$1
   local cli_mode=${2:-false}
+  local mysql_ver=""
   case $type in
   mysql)
     if command -v mysql >/dev/null 2>&1 || command -v mariadb >/dev/null 2>&1; then
@@ -1215,15 +1216,34 @@ install_database(){
       fi
     else
       echo -e "${YELLOW}未安裝MariaDB/MySQL。${RESET}" >&2
+      if [ $system -eq 1 || $system -eq 2 ]; then
+        echo "請選擇 MariaDB 版本:"
+        echo "1) 10.11 (支援至 2028 年) - 穩定成熟，適合自動化部署與生產環境"
+        echo "   → 已廣泛使用，安裝相容性高，風險低"
+        echo ""
+        echo "2) 11.4 (支援至 2029 年) - 功能更新，適合進階使用者"
+        echo "   → 查詢效能更好，支援 Online Schema Change，適合大型資料表或高併發場景"
+        echo ""
+        read -p "請輸入選擇 (1 或 2)[預設為 1]：" version_choice
+        version_choice=${version_choice:-1}
+        case $version_choice in
+        1)
+          mysql_ver=10.11
+          ;;
+        2)
+          mysql_ver=11.4
+          ;;
+        esac 
+      fi
       if [ $system -eq 1 ]; then
         apt install -y curl gnupg lsb-release
-        curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | sudo bash -s -- --mariadb-server-version="10.11"
+        curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | sudo bash -s -- --mariadb-server-version="$mysql_ver"
         apt update
         apt install -y mariadb-server
         systemctl enable mariadb
         systemctl start mariadb
       elif [ $system -eq 2 ]; then
-        curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | sudo bash -s -- --mariadb-server-version="10.11"
+        curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | sudo bash -s -- --mariadb-server-version="$mysql_ver"
         yum install -y MariaDB-server
         systemctl enable mariadb
         systemctl start mariadb
@@ -1242,7 +1262,7 @@ install_database(){
     if command -v pgsql >/dev/null 2>&1; then
       echo -e "${GREEN}已安裝PostgreSQL。${RESET}" >&2
       if [ $cli_mode == false ]; then
-        exec dbx pgsql
+        exec dba pgsql
       fi
     else
       echo -e "${YELLOW}未安裝PostgreSQL。${RESET}" >&2
@@ -1289,7 +1309,7 @@ install_database(){
       fi
       echo -e "${GREEN}PostgreSQL 已安裝完成。${RESET}" >&2
       if [ $cli_mode == false ]; then
-        exec dbx pgsql
+        exec dba pgsql
       fi
     fi
     ;;
