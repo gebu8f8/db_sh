@@ -1218,7 +1218,7 @@ install_database(){
       echo -e "${YELLOW}未安裝MariaDB/MySQL。${RESET}" >&2
       if [[ $system -eq 1 || $system -eq 2 ]]; then
         echo "請選擇 MariaDB 版本:"
-        echo "1) 10.11 (支援至 2028 年) - 穩定成熟，適合自動化部署與生產環境"
+        echo "1) 10.11.14 (支援至 2028 年) - 穩定成熟，適合自動化部署與生產環境"
         echo "   → 已廣泛使用，安裝相容性高，風險低"
         echo ""
         echo "2) 11.4 (支援至 2029 年) - 功能更新，適合進階使用者"
@@ -1228,7 +1228,7 @@ install_database(){
         version_choice=${version_choice:-1}
         case $version_choice in
         1)
-          mysql_ver=10.11
+          mysql_ver=10.11.14
           ;;
         2)
           mysql_ver=11.4
