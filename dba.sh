@@ -7,7 +7,7 @@ YELLOW='\033[1;33m'  # 警告用黃色
 CYAN='\033[0;36m'    # 一般提示用青色
 RESET='\033[0m'      # 清除顏色
 
-version="3.1.1"
+version="4.0.0"
 
 # 檢查是否以root權限運行
 if [ "$(id -u)" -ne 0 ]; then
@@ -1207,108 +1207,148 @@ install_database(){
   local type=$1
   local cli_mode=${2:-false}
   local mysql_ver=""
+  local lts_versions=""
   case $type in
   mysql)
     if command -v mysql >/dev/null 2>&1 || command -v mariadb >/dev/null 2>&1; then
-      echo -e "${GREEN}已安裝MariaDB/MySQL。${RESET}" >&2
-      if [ $cli_mode == false ]; then
+      echo -e "${GREEN}已安裝 MariaDB/MySQL。${RESET}" >&2
+      if [ "$cli_mode" == false ]; then
         exec dba mysql
       fi
     else
-      echo -e "${YELLOW}未安裝MariaDB/MySQL。${RESET}" >&2
+      echo -e "${YELLOW}未安裝 MariaDB/MySQL。${RESET}" >&2
       if [[ $system -eq 1 || $system -eq 2 ]]; then
-        echo "請選擇 MariaDB 版本:"
-        echo "1) 10.11.14 (支援至 2028 年) - 穩定成熟，適合自動化部署與生產環境"
-        echo "   → 已廣泛使用，安裝相容性高，風險低"
-        echo ""
-        echo "2) 11.4 (支援至 2029 年) - 功能更新，適合進階使用者"
-        echo "   → 查詢效能更好，支援 Online Schema Change，適合大型資料表或高併發場景"
-        echo ""
-        read -p "請輸入選擇 (1 或 2)[預設為 1]：" version_choice
-        version_choice=${version_choice:-1}
-        case $version_choice in
-        1)
-          mysql_ver=10.11.14
-          ;;
-        2)
-          mysql_ver=11.4
-          ;;
-        esac 
+
+        # 取得 LTS 版本清單（過濾掉已 EOL），並轉成單行
+        lts_versions=$(curl -s https://endoflife.date/api/mariadb.json \
+          | jq -r '.[] | select(.lts==true and (.eol | strptime("%Y-%m-%d") | mktime > now)) | .cycle' \
+          | sort -Vr)
+
+        # 轉成空白分隔的橫式
+        lts_line=$(echo $lts_versions)
+
+        echo "可選擇的 MariaDB LTS 版本：${lts_line}"
+
+        # 讀取用戶輸入
+        while true; do
+          read -p "請輸入要安裝的版本系列：" ver
+
+          if echo "$lts_versions" | grep -qx "$ver"; then
+            # 取得該系列的最新穩定版
+            mysql_ver=$(curl -s https://mariadb.org/mariadb/all-releases/ \
+              | grep -A2 "Name ${ver}" | grep Stable | head -n1 | awk '{print $1}')
+            echo "你選擇的版本系列：$ver，將安裝最新穩定版：$mysql_ver"
+            break
+          else
+            echo "輸入錯誤，請從列表中選擇"
+          fi
+        done
       fi
-      if [ $system -eq 1 ]; then
-        apt install -y curl gnupg lsb-release
-        curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | sudo bash -s -- --mariadb-server-version="$mysql_ver"
-        apt update
-        apt install -y mariadb-server
-        systemctl enable mariadb
-        systemctl start mariadb
-      elif [ $system -eq 2 ]; then
-        curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | sudo bash -s -- --mariadb-server-version="$mysql_ver"
-        yum install -y MariaDB-server
-        systemctl enable mariadb
-        systemctl start mariadb
-      elif [ $system -eq 3 ]; then
-        apk add mariadb mariadb-client mariadb-openrc
-        rc-update add mariadb default
-        mysql_install_db --user=mysql --basedir=/usr --datadir=/var/lib/mysql
-        service mariadb start
-      fi
-      if [ $cli_mode == false ]; then
-        exec dba mysql
-      fi
+
+      # Debian / Ubuntu
+      if [ "$system" -eq 1 ]; then
+        apt install -y curl gnupg lsb-release jq
+            curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup \
+              | sudo bash -s -- --mariadb-server-version="$mysql_ver"
+            apt update
+            apt install -y mariadb-server
+            systemctl enable mariadb
+            systemctl start mariadb
+
+        # CentOS / RHEL
+        elif [ "$system" -eq 2 ]; then
+            yum install -y curl jq
+            curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup \
+              | sudo bash -s -- --mariadb-server-version="$mysql_ver"
+            yum install -y MariaDB-server
+            systemctl enable mariadb
+            systemctl start mariadb
+
+        # Alpine
+        elif [ "$system" -eq 3 ]; then
+            apk add mariadb mariadb-client mariadb-openrc
+            rc-update add mariadb default
+            mysql_install_db --user=mysql --basedir=/usr --datadir=/var/lib/mysql
+            service mariadb start
+        fi
+
+        if [ "$cli_mode" == false ]; then
+            exec dba mysql
+        fi
     fi
     ;;
   pgsql)
-    if command -v pgsql >/dev/null 2>&1; then
-      echo -e "${GREEN}已安裝PostgreSQL。${RESET}" >&2
-      if [ $cli_mode == false ]; then
+    if command -v psql >/dev/null 2>&1; then
+      echo -e "${GREEN}已安裝 PostgreSQL。${RESET}" >&2
+      if [ "$cli_mode" == false ]; then
         exec dba pgsql
       fi
     else
-      echo -e "${YELLOW}未安裝PostgreSQL。${RESET}" >&2
-      if [ $system -eq 1 ]; then
-        if ! command -v gpg >/dev/null 2>&1; then
-          apt install -y gpg
+      echo -e "${YELLOW}未安裝 PostgreSQL。${RESET}" >&2
+
+      # 動態抓取仍在支援期的主版本
+      pg_versions=$(curl -s https://endoflife.date/api/postgresql.json \
+        | jq -r '.[] | select(.eol | strptime("%Y-%m-%d") | mktime > now) | .cycle' \
+        | sort -Vr)
+      pg_line=$(echo $pg_versions)
+
+      echo "可選擇的 PostgreSQL 支援版本：${pg_line}"
+      while true; do
+        read -p "請輸入要安裝的版本系列：" pg_ver
+
+        if echo "$pg_versions" | grep -qx "$pg_ver"; then
+          echo "你選擇的版本系列：$pg_ver，將安裝最新穩定版"
+          break
+        else
+          echo " 輸入錯誤，請從列表中選擇支援版本"
         fi
-        wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/pgdg-archive-keyring.gpg
-        local codename=$(lsb_release -c -s)
-        echo "deb [signed-by=/usr/share/keyrings/pgdg-archive-keyring.gpg] http://apt.postgresql.org/pub/repos/apt ${codename}-pgdg main" | tee /etc/apt/sources.list.d/pgdg.list
+      done
+
+      if [ "$system" -eq 1 ]; then
+        apt install -y gpg wget lsb-release
+        wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+          | gpg --dearmor -o /usr/share/keyrings/pgdg-archive-keyring.gpg
+        codename=$(lsb_release -c -s)
+        echo "deb [signed-by=/usr/share/keyrings/pgdg-archive-keyring.gpg] \
+          https://apt.postgresql.org/pub/repos/apt ${codename}-pgdg main" \
+          | tee /etc/apt/sources.list.d/pgdg.list
         apt update
-        apt install -y postgresql-17 postgresql-client-17
+        apt install -y "postgresql-$pg_ver" "postgresql-client-$pg_ver"
         systemctl enable postgresql
         systemctl start postgresql
-      elif [ $system -eq 2 ]; then
-        local major_ver=$(rpm -E %{rhel})
-        yum install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-${major_ver}-x86_64/pgdg-redhat-repo-latest.noarch.rpm
-        yum config-manager --disable pgdg16
-        yum config-manager --enable pgdg17
+
+      elif [ "$system" -eq 2 ]; then
+        major_ver=$(rpm -E %{rhel})
+        yum install -y "https://download.postgresql.org/pub/repos/yum/reporpms/EL-${major_ver}-x86_64/pgdg-redhat-repo-latest.noarch.rpm"
+        yum config-manager --disable pgdg*
+        yum config-manager --enable "pgdg$pg_ver"
         if [ "$major_ver" -ge 8 ]; then
           dnf -qy module disable postgresql
         fi
-        yum install -y postgresql17-server postgresql17
-        /usr/pgsql-17/bin/postgresql-17-setup initdb
-        systemctl enable postgresql-17
-        systemctl start postgresql-17
-      elif [ "$system" -eq 3 ]; then
-        echo "http://dl-cdn.alpinelinux.org/alpine/edge/main" >> /etc/apk/repositories
-        apk update
+        yum install -y "postgresql$pg_ver-server" "postgresql$pg_ver"
+          "/usr/pgsql-$pg_ver/bin/postgresql-$pg_ver-setup" initdb
+        systemctl enable "postgresql-$pg_ver"
+        systemctl start "postgresql-$pg_ver"
 
+      elif [ "$system" -eq 3 ]; then
+        echo "https://dl-cdn.alpinelinux.org/alpine/edge/main" >> /etc/apk/repositories
+        apk update
         apk add --no-cache \
-          postgresql17 --repository=http://dl-cdn.alpinelinux.org/alpine/edge/main --allow-untrusted \
-          postgresql17-contrib --repository=http://dl-cdn.alpinelinux.org/alpine/edge/main --allow-untrusted \
-          postgresql17-openrc --repository=http://dl-cdn.alpinelinux.org/alpine/edge/main --allow-untrusted
+          "postgresql$pg_ver" \
+          "postgresql$pg_ver-client" \
+          "postgresql$pg_ver-contrib" \
+          "postgresql$pg_ver-openrc"
 
         mkdir -p /run/postgresql
         chown postgres:postgres /run/postgresql
-
         install -d -m0700 -o postgres -g postgres /var/lib/postgresql/data
         su - postgres -c "/usr/bin/initdb -D /var/lib/postgresql/data"
-
         rc-update add postgresql default
         rc-service postgresql start
       fi
+
       echo -e "${GREEN}PostgreSQL 已安裝完成。${RESET}" >&2
-      if [ $cli_mode == false ]; then
+      if [ "$cli_mode" == false ]; then
         exec dba pgsql
       fi
     fi
@@ -1666,8 +1706,8 @@ case "$1" in
   mysql)
     case "$2" in
     install)
-      cil_mode=true
-      install_database mysql $c 
+      cli_mode=true
+      install_database mysql $cli_mode
       ;;
     add)
       check_mysql
