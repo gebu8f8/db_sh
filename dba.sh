@@ -7,7 +7,7 @@ YELLOW='\033[1;33m'  # 警告用黃色
 CYAN='\033[0;36m'    # 一般提示用青色
 RESET='\033[0m'      # 清除顏色
 
-version="4.0.2"
+version="4.0.3"
 
 # 檢查是否以root權限運行
 if [ "$(id -u)" -ne 0 ]; then
@@ -1096,10 +1096,10 @@ export_database() {
 import_database() {
   case $db_mode in
   mysql)
-    local backup_dir="/root/mysql_backups"
+    local backup_dir="${2:-/root/mysql_backups}"
     ;;
   pgsql)
-    local backup_dir="/root/postgres_backups"
+    local backup_dir="${2:-/root/postgres_backups}"
     ;;
   esac
   if [ ! -d "$backup_dir" ] || [ -z "$(ls -A ${backup_dir}/*.sql 2>/dev/null)" ]; then
@@ -1752,6 +1752,12 @@ case "$1" in
       export_database "$dbname"
       exit
       ;;
+    "import")
+      check_mysql
+      path=$3
+      import_database "$path"
+      exit
+      ;;
     *)
       check_mysql
       db_mode=mysql
@@ -1795,6 +1801,12 @@ case "$1" in
       check_pgsql
       dbname=$3
       export_database "$dbname"
+      exit
+      ;;
+    "import")
+      check_pgsql
+      path=$3
+      import_database "$path"
       exit
       ;;
     *)
