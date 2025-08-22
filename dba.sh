@@ -7,7 +7,7 @@ YELLOW='\033[1;33m'  # 警告用黃色
 CYAN='\033[0;36m'    # 一般提示用青色
 RESET='\033[0m'      # 清除顏色
 
-version="4.0.3"
+version="4.0.4"
 
 # 檢查是否以root權限運行
 if [ "$(id -u)" -ne 0 ]; then
@@ -305,6 +305,7 @@ get_mysql_command() {
         fi
     done
 }
+
 
 
 # 全域變數 PSQL_CMD 和 PGDUMP_CMD
@@ -1094,77 +1095,90 @@ export_database() {
 
 # 匯入資料庫
 import_database() {
+  local cli_mode=${2:-false}
+  local backup_dir
   case $db_mode in
   mysql)
-    local backup_dir="${2:-/root/mysql_backups}"
+    backup_dir="${3:-/root/mysql_backups}"
     ;;
   pgsql)
-    local backup_dir="${2:-/root/postgres_backups}"
-    ;;
+    backup_dir="${3:-/root/postgres_backups}"
+        ;;
   esac
   if [ ! -d "$backup_dir" ] || [ -z "$(ls -A ${backup_dir}/*.sql 2>/dev/null)" ]; then
-    echo -e "${YELLOW}找不到任何備份檔案於 ${backup_dir} 目錄中。${RESET}"
+    echo -e "${YELLOW}找不到任何備份檔案於 ${backup_dir} 目錄中。${RESET}" >&2
     sleep 2
     return 1
   fi
-  echo -e "${CYAN}可用的備份檔案：${RESET}"
 
-  # 使用 while read 迴圈取代 mapfile，以獲得更好的相容性
+  # 列出備份檔
   local backup_files=()
   while IFS= read -r line; do
     backup_files+=("$line")
   done < <(find "$backup_dir" -maxdepth 1 -name "*.sql" | sort)
 
+  echo -e "${CYAN}可用的備份檔案：${RESET}" >&2
   for i in "${!backup_files[@]}"; do
-    printf "%3d) %s\n" "$((i+1))" "$(basename "${backup_files[$i]}")"
+    printf "%3d) %s\n" "$((i+1))" "$(basename "${backup_files[$i]}")" >&2
   done
-  echo
-
-  local choice
+  echo >&2
   read -p "請選擇要匯入的備份檔案編號：" choice
-
   if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#backup_files[@]}" ]; then
-    echo -e "${RED}無效的選擇！${RESET}"
+    echo -e "${RED}無效的選擇！${RESET}" >&2
     return 1
   fi
-
   local selected_file="${backup_files[$((choice-1))]}"
   local auto_dbname=$(basename "$selected_file" | sed -E 's/_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}\.sql$//')
-
-  read -p "請輸入要匯入的目標資料庫名稱 [留空預設為: ${auto_dbname}]: " target_dbname
-  target_dbname=${target_dbname:-$auto_dbname}
-
-  echo -e "${CYAN}準備將 '${selected_file}' 匯入到資料庫 '${target_dbname}'...${RESET}"
-  read -p "這個操作可能會覆蓋現有資料，確定要繼續嗎？ (y/n) " confirm
-  if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-    echo -e "${YELLOW}操作已取消。${RESET}"
-    return 1
+  if [ -z $target_dbname ]; then
+    read -p "請輸入要匯入的目標資料庫名稱 [留空預設為: ${auto_dbname}]: " target_dbname
+    target_dbname=${target_dbname:-$auto_dbname}
   fi
-  
-  if [ $db_mode = mysql ]; then
-    "${MYSQL_CMD[@]}" -e "CREATE DATABASE IF NOT EXISTS \`$target_dbname\`;"
-    echo -e "${CYAN}正在匯入...${RESET}"
-    
-    if "${MYSQL_CMD[@]}" "$target_dbname" < "$selected_file"; then
-      echo -e "${GREEN}資料庫 '$target_dbname' 已成功從 '$selected_file' 匯入。${RESET}"
-    else
-      echo -e "${RED}資料庫匯入失敗！${RESET}"
+  if [ $cli_mode == false ]; then
+    read -p "這個操作可能會覆蓋現有資料，確定要繼續嗎？ (y/n) " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      echo -e "${YELLOW}操作已取消。${RESET}" >&2
       return 1
     fi
-    return 0
-  fi
-
-  # 確保目標資料庫存在
-  if ! sudo -iu postgres psql -lqt | cut -d \| -f 1 | grep -qw "$target_dbname"; then
-    sudo -iu postgres psql -c "CREATE DATABASE \"$target_dbname\";"
-  fi
-
-  echo -e "${CYAN}正在匯入...${RESET}"
-
-  if sudo -iu postgres psql -d "$target_dbname" < "$selected_file"; then
-    echo -e "${GREEN}資料庫 '$target_dbname' 已成功從 '$selected_file' 匯入。${RESET}"
   else
-    echo -e "${RED}資料庫匯入失敗！${RESET}"
+    # CLI 模式，直接使用 $3、$4
+    selected_file="${backup_files[0]}"
+    target_dbname="${3:?請提供資料庫名稱作為第3個參數}"
+    dbuser="${4:?請提供資料庫用戶名稱作為第4個參數}"
+    dbpass="${5:?請提供資料庫用戶名稱作為第5個參數}"
+    echo -e "${CYAN}準備將 '${selected_file}' 匯入到資料庫 '${target_dbname}' 並建立用戶 '${dbuser}'...${RESET}" >&2
+    fi
+
+    if [ "$db_mode" = "mysql" ]; then
+      # CLI 模式下建立資料庫與用戶並授權
+      if [ "$cli_mode" = true ]; then
+        create_database "$dbname" "$dbuser" "$dbpass" "n" true 
+      else
+        "${MYSQL_CMD[@]}" -e "CREATE DATABASE IF NOT EXISTS \`$target_dbname\`;" >&2
+      fi
+
+      echo -e "${CYAN}正在匯入資料...${RESET}" >&2
+      if "${MYSQL_CMD[@]}" "$target_dbname" < "$selected_file"; then
+        echo -e "${GREEN}資料庫 '$target_dbname' 已成功從 '$selected_file' 匯入。${RESET}" >&2
+      else
+        echo -e "${RED}資料庫匯入失敗！${RESET}" >&2
+        return 1
+      fi
+    elif [ "$db_mode" = "pgsql" ]; then
+      if [ "$cli_mode" = true ]; then
+      create_database "$dbname" "$dbuser" "$dbpass" "n" true 
+      else
+        # 確保目標資料庫存在
+        if ! sudo -iu postgres psql -lqt | cut -d \| -f 1 | grep -qw "$target_dbname"; then
+          sudo -iu postgres psql -c "CREATE DATABASE \"$target_dbname\";" >&2
+      fi
+      echo -e "${CYAN}正在匯入資料...${RESET}" >&2
+      if sudo -iu postgres psql -d "$target_dbname" < "$selected_file"; then
+        echo -e "${GREEN}資料庫 '$target_dbname' 已成功從 '$selected_file' 匯入。${RESET}" >&2
+      else
+        echo -e "${RED}資料庫匯入失敗！${RESET}" >&2
+        return 1
+      fi
+    fi
   fi
 }
 
@@ -1244,10 +1258,10 @@ install_database(){
         while true; do
           read -p "請輸入要安裝的版本系列：" ver
 
-          if echo "$lts_versions" | grep -qx "$ver"; then
+          if echo "$lts_versions" | grep -qw "$ver"; then
             # 取得該系列的最新穩定版
-            mysql_ver=$(curl -s https://mariadb.org/mariadb/all-releases/ \
-              | grep -A2 "Name ${ver}" | grep Stable | head -n1 | awk '{print $1}')
+            mysql_ver=$(curl -s https://endoflife.date/api/mariadb.json \
+              | jq -r --arg ver "$ver" '.[] | select(.lts==true and .cycle==$ver) | .latest')
             echo "你選擇的版本系列：$ver，將安裝最新穩定版：$mysql_ver"
             break
           else
@@ -1307,7 +1321,7 @@ install_database(){
       while true; do
         read -p "請輸入要安裝的版本系列：" pg_ver
 
-        if echo "$pg_versions" | grep -qx "$pg_ver"; then
+        if echo "$pg_versions" | grep -qw "$pg_ver"; then
           echo "你選擇的版本系列：$pg_ver，將安裝最新穩定版"
           break
         else
@@ -1507,7 +1521,7 @@ show_mysql_info() {
 }
 
 update_script() {
-  local download_url="https://raw.githubusercontent.com/gebu8f8/db_sh/refs/heads/main/dba.sh"
+  local download_url="https://gitlab.com/gebu8f/sh/-/raw/main/db/dba.sh"
   local temp_path="/tmp/dba.sh"
   local current_script="/usr/local/bin/dba"
   local current_path="$0"
@@ -1754,8 +1768,12 @@ case "$1" in
       ;;
     "import")
       check_mysql
+      cli_mode=true
       path=$3
-      import_database "$path"
+      dbname=$4
+      dbuser=$5
+      dbpass=$6
+      import_database $cli_mode "$path" "$dbname" "$dbuser" "dbpass"
       exit
       ;;
     *)
@@ -1771,7 +1789,7 @@ case "$1" in
       cli_mode=${3:-false}
       install_database pgsql $cli_mode
       if [ "$cli_mode" == false ]; then
-        exec dba mysql
+        exec dba pgsql
       else
         exit 0
       fi
@@ -1806,7 +1824,10 @@ case "$1" in
     "import")
       check_pgsql
       path=$3
-      import_database "$path"
+      dbname=$4
+      dbuser=$5
+      dbpass=$6
+      import_database $cli_mode "$path" "$dbname" "$dbuser" "$dbpass"
       exit
       ;;
     *)
