@@ -7,7 +7,7 @@ YELLOW='\033[1;33m'  # 警告用黃色
 CYAN='\033[0;36m'    # 一般提示用青色
 RESET='\033[0m'      # 清除顏色
 
-version="4.0.0"
+version="4.0.2"
 
 # 檢查是否以root權限運行
 if [ "$(id -u)" -ne 0 ]; then
@@ -250,49 +250,60 @@ deploy_db_admin_ui() {
 MYSQL_CMD=()
 
 get_mysql_command() {
-  # 如果 MYSQL_CMD 已經設定，就直接返回
-  if [ ${#MYSQL_CMD[@]} -gt 0 ]; then
-    return 0
-  fi
-
-  local mysql_root_pw=""
-  local pass_file="/etc/mysql-pass.conf"
-
-  # 嘗試無密碼登入
-  if mysql -u root -e "SELECT 1;" &>/dev/null; then
-    MYSQL_CMD=("mysql" "-u" "root")
-    return 0
-  fi
-
-  # 嘗試讀取 /etc/mysql-pass.conf
-  if [ -f "$pass_file" ]; then
-    mysql_root_pw=$(< "$pass_file")
-    if mysql -u root -p"$mysql_root_pw" -e "SELECT 1;" &>/dev/null; then
-      MYSQL_CMD=("mysql" "-u" "root" "-p$mysql_root_pw")
-      return 0
-    fi
-  fi
-
-  # 不存在 conf 或無效，請使用者輸入
-  while true; do
-    read -s -p "請輸入 MySQL root 密碼：" mysql_root_pw
-    echo
-    if [ -z "$mysql_root_pw" ]; then
-      echo -e "${YELLOW}密碼不能為空，請再試一次。${RESET}"
-      continue
+    # 如果 MYSQL_CMD 已經設定，就直接返回
+    if [ ${#MYSQL_CMD[@]} -gt 0 ]; then
+        return 0
     fi
 
-    if mysql -u root -p"$mysql_root_pw" -e "SELECT 1;" &>/dev/null; then
-      echo -e "${GREEN}密碼正確，已成功登入 MySQL${RESET}" 
-      echo "$mysql_root_pw" > "$pass_file"
-      chmod 600 "$pass_file"
-      echo -e "${GREEN}已將 root 密碼寫入 $pass_file (權限 600)${RESET}"
-      MYSQL_CMD=("mysql" "-u" "root" "-p$mysql_root_pw")
-      return 0
+    local mysql_root_pw=""
+    local pass_file="/etc/mysql-pass.conf"
+    local cmd=""
+
+    # 優先使用 mariadb 指令
+    if command -v mariadb >/dev/null 2>&1; then
+        cmd="mariadb"
+    elif command -v mysql >/dev/null 2>&1; then
+        cmd="mysql"
     else
-      echo -e "${RED}密碼錯誤，請再試一次。${RESET}"
+        echo -e "${RED}系統未安裝 mariadb 或 mysql${RESET}"
+        exit 1
     fi
-  done
+
+    # 嘗試無密碼登入
+    if $cmd -u root -e "SELECT 1;" &>/dev/null; then
+        MYSQL_CMD=("$cmd" "-u" "root")
+        return 0
+    fi
+
+    # 嘗試讀取 /etc/mysql-pass.conf
+    if [ -f "$pass_file" ]; then
+        mysql_root_pw=$(< "$pass_file")
+        if $cmd -u root -p"$mysql_root_pw" -e "SELECT 1;" &>/dev/null; then
+            MYSQL_CMD=("$cmd" "-u" "root" "-p$mysql_root_pw")
+            return 0
+        fi
+    fi
+
+    # 不存在 conf 或無效，請使用者輸入
+    while true; do
+        read -s -p "請輸入 MySQL root 密碼：" mysql_root_pw
+        echo
+        if [ -z "$mysql_root_pw" ]; then
+            echo -e "${YELLOW}密碼不能為空，請再試一次。${RESET}"
+            continue
+        fi
+
+        if $cmd -u root -p"$mysql_root_pw" -e "SELECT 1;" &>/dev/null; then
+            echo -e "${GREEN}密碼正確，已成功登入 MySQL${RESET}" 
+            echo "$mysql_root_pw" > "$pass_file"
+            chmod 600 "$pass_file"
+            echo -e "${GREEN}已將 root 密碼寫入 $pass_file (權限 600)${RESET}"
+            MYSQL_CMD=("$cmd" "-u" "root" "-p$mysql_root_pw")
+            return 0
+        else
+            echo -e "${RED}密碼錯誤，請再試一次。${RESET}"
+        fi
+    done
 }
 
 
@@ -1706,8 +1717,13 @@ case "$1" in
   mysql)
     case "$2" in
     install)
-      cli_mode=true
+      cli_mode=${3:-false}
       install_database mysql $cli_mode
+      if [ "$cli_mode" == false ]; then
+        exec dba mysql
+      else
+        exit 0
+      fi
       ;;
     add)
       check_mysql
@@ -1746,8 +1762,13 @@ case "$1" in
   pgsql)
     case $2 in
     install)
-      cli_mode=true
+      cli_mode=${3:-false}
       install_database pgsql $cli_mode
+      if [ "$cli_mode" == false ]; then
+        exec dba mysql
+      else
+        exit 0
+      fi
       ;;
     add)
       check_pgsql
