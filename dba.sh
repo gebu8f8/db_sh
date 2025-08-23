@@ -7,7 +7,7 @@ YELLOW='\033[1;33m'  # 警告用黃色
 CYAN='\033[0;36m'    # 一般提示用青色
 RESET='\033[0m'      # 清除顏色
 
-version="4.0.4"
+version="4.0.5"
 
 # 檢查是否以root權限運行
 if [ "$(id -u)" -ne 0 ]; then
@@ -83,6 +83,22 @@ check_app(){
     3)
       apk update
       apk add wget
+      ;;
+    esac
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    case $system in
+    1)
+      apt update
+      apt install jq -y
+      ;;
+    2)
+      yum update
+      yum install jq -y
+      ;;
+    3)
+      apk update
+      apk add jq
       ;;
     esac
   fi
@@ -1146,30 +1162,29 @@ import_database() {
     dbuser="${4:?請提供資料庫用戶名稱作為第4個參數}"
     dbpass="${5:?請提供資料庫用戶名稱作為第5個參數}"
     echo -e "${CYAN}準備將 '${selected_file}' 匯入到資料庫 '${target_dbname}' 並建立用戶 '${dbuser}'...${RESET}" >&2
+  fi
+  if [ "$db_mode" = "mysql" ]; then
+    # CLI 模式下建立資料庫與用戶並授權
+    if [ "$cli_mode" = true ]; then
+      create_database "$dbname" "$dbuser" "$dbpass" "n" true 
+    else
+      "${MYSQL_CMD[@]}" -e "CREATE DATABASE IF NOT EXISTS \`$target_dbname\`;" >&2
     fi
 
-    if [ "$db_mode" = "mysql" ]; then
-      # CLI 模式下建立資料庫與用戶並授權
-      if [ "$cli_mode" = true ]; then
-        create_database "$dbname" "$dbuser" "$dbpass" "n" true 
-      else
-        "${MYSQL_CMD[@]}" -e "CREATE DATABASE IF NOT EXISTS \`$target_dbname\`;" >&2
-      fi
-
-      echo -e "${CYAN}正在匯入資料...${RESET}" >&2
-      if "${MYSQL_CMD[@]}" "$target_dbname" < "$selected_file"; then
-        echo -e "${GREEN}資料庫 '$target_dbname' 已成功從 '$selected_file' 匯入。${RESET}" >&2
-      else
-        echo -e "${RED}資料庫匯入失敗！${RESET}" >&2
-        return 1
-      fi
-    elif [ "$db_mode" = "pgsql" ]; then
-      if [ "$cli_mode" = true ]; then
+    echo -e "${CYAN}正在匯入資料...${RESET}" >&2
+    if "${MYSQL_CMD[@]}" "$target_dbname" < "$selected_file"; then
+      echo -e "${GREEN}資料庫 '$target_dbname' 已成功從 '$selected_file' 匯入。${RESET}" >&2
+    else
+      echo -e "${RED}資料庫匯入失敗！${RESET}" >&2
+      return 1
+    fi
+  elif [ "$db_mode" = "pgsql" ]; then
+    if [ "$cli_mode" = true ]; then
       create_database "$dbname" "$dbuser" "$dbpass" "n" true 
-      else
-        # 確保目標資料庫存在
-        if ! sudo -iu postgres psql -lqt | cut -d \| -f 1 | grep -qw "$target_dbname"; then
-          sudo -iu postgres psql -c "CREATE DATABASE \"$target_dbname\";" >&2
+    else
+      # 確保目標資料庫存在
+      if ! sudo -iu postgres psql -lqt | cut -d \| -f 1 | grep -qw "$target_dbname"; then
+        sudo -iu postgres psql -c "CREATE DATABASE \"$target_dbname\";" >&2
       fi
       echo -e "${CYAN}正在匯入資料...${RESET}" >&2
       if sudo -iu postgres psql -d "$target_dbname" < "$selected_file"; then
