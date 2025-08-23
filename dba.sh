@@ -7,7 +7,7 @@ YELLOW='\033[1;33m'  # 警告用黃色
 CYAN='\033[0;36m'    # 一般提示用青色
 RESET='\033[0m'      # 清除顏色
 
-version="4.0.5"
+version="4.0.6"
 
 # 檢查是否以root權限運行
 if [ "$(id -u)" -ne 0 ]; then
@@ -329,17 +329,33 @@ PSQL_CMD=()
 PGDUMP_CMD=()
 
 get_postgres_command() {
-  if id "postgres" &>/dev/null; then
-    # 加上 -i 參數，模擬 postgres 使用者登入，
-    # 這會將工作目錄切換到 postgres 的家目錄，從而避免在 /root 目錄下執行導致的權限警告。
-    PSQL_CMD=("sudo" "-iu" "postgres" "psql" "-q" "-t" "-A")
-    PSQL_EXEC_CMD=("sudo" "-iu" "postgres" "psql" "-c")
-    PGDUMP_CMD=("sudo" "-iu" "postgres" "pg_dump")
-    return 0
-  else
+  # --- 前置檢查 (保持不變) ---
+  if ! id "postgres" &>/dev/null; then
     echo -e "${RED}找不到 postgres 系統使用者，請確認 PostgreSQL 是否已正確安裝並初始化。${RESET}"
     exit 1
   fi
+  if ! command -v sudo &>/dev/null; then
+    echo -e "${RED}系統未安裝 sudo，請先安裝 sudo 套件。${RESET}"
+    exit 1
+  fi
+  
+  _filtered_sudo() {
+    # 執行真正的 sudo 命令，並將其標準錯誤(stderr)透過「程序替換」
+    # 傳遞給 grep 進行過濾，過濾後的結果再送回原始的 stderr。
+    # 這樣只會移除目標警告，而保留其他所有真正的錯誤訊息。
+    sudo "$@" 2> >(grep -v "unable to resolve host" >&2)
+  }
+  # 將這個內部函式匯出，確保它在所有地方都可被呼叫
+  export -f _filtered_sudo
+
+  # --- 重新定義你的三個全域變數 ---
+  # 注意看：我們只是把陣列的第一個元素 "sudo" 換成了 "_filtered_sudo"
+  # 其他所有參數都保持原樣！
+  PSQL_CMD=("_filtered_sudo" "-iu" "postgres" "psql" "-q" "-t" "-A")
+  PSQL_EXEC_CMD=("_filtered_sudo" "-iu" "postgres" "psql" "-c")
+  PGDUMP_CMD=("_filtered_sudo" "-iu" "postgres" "pg_dump")
+  
+  return 0
 }
 
 enable_postgres_user_external_access() {
@@ -347,8 +363,8 @@ enable_postgres_user_external_access() {
   
   echo -e "${CYAN}正在設定 listen_addresses = '*'...${RESET}" >&2
 
-  local conf_file=$(sudo -iu postgres psql -tAc "SHOW config_file;")
-  local hba_file=$(sudo -iu postgres psql -tAc "SHOW hba_file;")
+  local conf_file=$(_filtered_sudo -iu postgres psql -tAc "SHOW config_file;")
+  local hba_file=$(_filtered_sudo -iu postgres psql -tAc "SHOW hba_file;")
 
   if [ ! -f "$conf_file" ] || [ ! -f "$hba_file" ]; then
     echo -e "${RED}找不到 PostgreSQL 設定檔，無法繼續。${RESET}"
@@ -396,7 +412,7 @@ revoke_user_external_access() {
   echo "檢查是否存在外網訪問規則：$username"
 
   # 取得 pg_hba.conf 路徑
-  local hba_file=$(sudo -iu postgres psql -tAc "SHOW hba_file;")
+  local hba_file=$(_filtered_sudo -iu postgres psql -tAc "SHOW hba_file;")
 
   if [[ ! -f "$hba_file" ]]; then
     echo -e "找不到 pg_hba.conf 檔案：$hba_file"
@@ -838,8 +854,8 @@ create_super_user() {
     fi
 
   elif [ "$db_mode" = "pgsql" ]; then
-    local PG_HBA=$(sudo -iu postgres psql -tAc "SHOW hba_file;")
-    local PG_CONF=$(sudo -iu postgres psql -tAc "SHOW config_file;")
+    local PG_HBA=$(_filtered_sudo -iu postgres psql -tAc "SHOW hba_file;")
+    local PG_CONF=$(_filtered_sudo -iu postgres psql -tAc "SHOW config_file;")
 
     # 建立 PostgreSQL 超級帳號
     "${PSQL_EXEC_CMD[@]}" "SELECT 1 FROM pg_roles WHERE rolname='$username'" | grep -q 1 || \
@@ -1183,11 +1199,11 @@ import_database() {
       create_database "$dbname" "$dbuser" "$dbpass" "n" true 
     else
       # 確保目標資料庫存在
-      if ! sudo -iu postgres psql -lqt | cut -d \| -f 1 | grep -qw "$target_dbname"; then
-        sudo -iu postgres psql -c "CREATE DATABASE \"$target_dbname\";" >&2
+      if ! _filtered_sudo -iu postgres psql -lqt | cut -d \| -f 1 | grep -qw "$target_dbname"; then
+        _filtered_sudo -iu postgres psql -c "CREATE DATABASE \"$target_dbname\";" >&2
       fi
       echo -e "${CYAN}正在匯入資料...${RESET}" >&2
-      if sudo -iu postgres psql -d "$target_dbname" < "$selected_file"; then
+      if _filtered_sudo -iu postgres psql -d "$target_dbname" < "$selected_file"; then
         echo -e "${GREEN}資料庫 '$target_dbname' 已成功從 '$selected_file' 匯入。${RESET}" >&2
       else
         echo -e "${RED}資料庫匯入失敗！${RESET}" >&2
