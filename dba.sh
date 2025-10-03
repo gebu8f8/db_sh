@@ -7,7 +7,7 @@ YELLOW='\033[1;33m'  # 警告用黃色
 CYAN='\033[0;36m'    # 一般提示用青色
 RESET='\033[0m'      # 清除顏色
 
-version="4.0.6"
+version="4.0.7"
 
 # 檢查是否以root權限運行
 if [ "$(id -u)" -ne 0 ]; then
@@ -879,12 +879,11 @@ create_super_user() {
     if [ "$cli_mode" = true ]; then
       return
     fi
-
-    echo "======帳號信息======"
-    echo "用戶名：$username"
-    echo "密碼：$password"
-    read -p "操作完成，請按任意鍵繼續" -n1
   fi
+  echo "======帳號信息======"
+  echo "用戶名：$username"
+  echo "密碼：$password"
+  read -p "操作完成，請按任意鍵繼續" -n1
 }
 
 # 重製密碼
