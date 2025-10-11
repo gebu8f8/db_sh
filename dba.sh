@@ -7,7 +7,7 @@ YELLOW='\033[1;33m'  # 警告用黃色
 CYAN='\033[0;36m'    # 一般提示用青色
 RESET='\033[0m'      # 清除顏色
 
-version="4.0.7"
+version="4.0.8"
 
 # 檢查是否以root權限運行
 if [ "$(id -u)" -ne 0 ]; then
@@ -1414,63 +1414,129 @@ install_database(){
 
 # 顯示 PostgreSQL 資料庫、擁有者、可存取使用者，以及孤立使用者
 show_postgres_info(){
+  # --- 排版輔助函式 (處理中英文對齊) ---
+  # 此函式為內部使用，使用完畢後將會被 unset
+  display_width() {
+    local str="$1"
+    local clean_str=$(echo -e "$str" | sed "s/\x1B\[[0-9;]*[mK]//g")
+    local width=0; local i=0
+    while [ $i -lt ${#clean_str} ]; do
+      local char="${clean_str:$i:1}"
+      if [[ $(printf "%d" "'$char") -gt 127 ]] 2>/dev/null; then
+        width=$((width + 2))
+      else
+        width=$((width + 1))
+      fi
+      i=$((i + 1))
+    done
+    echo $width
+  }
+
   get_postgres_command
   echo -e "\n${CYAN}目 前 資 料 庫 與 用 戶 狀 態 ：${RESET}"
-  echo -e "\033[1;34m----------------------------------------------------------------------\033[0m"
 
+  # --- 階段一：收集所有需要顯示的資料 ---
+  
+  # 優化 SQL 查詢：
+  # 1. 使用 COALESCE 處理 NULL，直接輸出 '無'，讓邏輯更清晰。
   local db_info_query="
     SELECT
       d.datname,
       r.rolname,
-      (SELECT string_agg(u.rolname, ', ')
-       FROM pg_roles u
-       WHERE has_database_privilege(u.rolname, d.datname, 'CONNECT')
-         AND u.rolname NOT LIKE 'pg_%'
-         AND u.rolname != 'postgres'
-         AND u.rolname != r.rolname)
+      COALESCE(
+        (SELECT string_agg(u.rolname, ', ')
+         FROM pg_roles u
+         WHERE has_database_privilege(u.rolname, d.datname, 'CONNECT')
+           AND u.rolname NOT LIKE 'pg_%'
+           AND u.rolname != 'postgres'
+           AND u.rolname != r.rolname),
+        '無'
+      )
     FROM pg_database d
     JOIN pg_roles r ON d.datdba = r.oid
     WHERE d.datistemplate = false AND d.datname <> 'postgres'
     ORDER BY d.datname;
   "
 
-  local db_info=$("${PSQL_CMD[@]}" -c "$db_info_query")
+  local -a data_rows
+  # 使用進程替換，避免 subshell 問題
+  # 使用 psql 的 -t -A -F'|' 選項，獲得乾淨、無標頭、以'|'分隔的輸出
+  while IFS='|' read -r db owner users; do
+    # 去除可能存在的前後空白
+    db=$(echo "$db" | xargs)
+    owner=$(echo "$owner" | xargs)
+    users=$(echo "$users" | xargs)
+    data_rows+=("$db|$owner|$users")
+  done < <("${PSQL_CMD[@]}" -t -A -F'|' -c "$db_info_query")
 
-  if [ -z "$db_info" ]; then
-    echo -e "${YELLOW}  尚 無 自 訂 資 料 庫 。${RESET}"
+  if [ ${#data_rows[@]} -eq 0 ]; then
+    echo -e "${YELLOW}  尚 無 自 訂 資 料 庫。${RESET}"
   else
-    printf "%-25s | %-20s | %s\n" "資 料 庫 名 稱" "擁 有 者" "其 他 可 存 取 用 戶"
-    echo -e "\033[1;34m----------------------------------------------------------------------\033[0m"
-    echo "$db_info" | while IFS='|' read -r db owner users; do
-        printf "%-25s | %-20s | %s\n" "$(echo $db)" "$(echo $owner)" "$(echo ${users:-無})"
+    # --- 階段二：計算各欄位的最大寬度 ---
+    local headers=("資 料 庫 名 稱" "擁 有 者" "其 他 可 存 取 用 戶")
+    local -a max_widths=()
+    max_widths[0]=$(display_width "${headers[0]}")
+    max_widths[1]=$(display_width "${headers[1]}")
+    max_widths[2]=$(display_width "${headers[2]}")
+
+    for row in "${data_rows[@]}"; do
+      IFS='|' read -r db owner users <<< "$row"
+      local db_width=$(display_width "$db")
+      local owner_width=$(display_width "$owner")
+      local users_width=$(display_width "$users")
+
+      if [[ $db_width -gt ${max_widths[0]} ]]; then max_widths[0]=$db_width; fi
+      if [[ $owner_width -gt ${max_widths[1]} ]]; then max_widths[1]=$owner_width; fi
+      if [[ $users_width -gt ${max_widths[2]} ]]; then max_widths[2]=$users_width; fi
     done
+
+    # --- 階段三：根據計算好的寬度，格式化輸出 ---
+    local total_width=$((max_widths[0] + max_widths[1] + max_widths[2] + 6)) # +6 for " | " x 2
+    local separator=$(printf '%.0s-' $(seq 1 $total_width))
+    
+    echo -e "\033[1;34m$separator\033[0m"
+    
+    # 輸出標頭
+    local h_col1="${headers[0]}"; local p1=$((max_widths[0] - $(display_width "$h_col1"))); h_col1+=$(printf "%*s" $p1 "")
+    local h_col2="${headers[1]}"; local p2=$((max_widths[1] - $(display_width "$h_col2"))); h_col2+=$(printf "%*s" $p2 "")
+    local h_col3="${headers[2]}"; local p3=$((max_widths[2] - $(display_width "$h_col3"))); h_col3+=$(printf "%*s" $p3 "")
+    echo -e "$h_col1 | $h_col2 | $h_col3"
+
+    echo -e "\033[1;34m$separator\033[0m"
+
+    # 輸出資料
+    for row in "${data_rows[@]}"; do
+      IFS='|' read -r db owner users <<< "$row"
+      local col1="$db"; local pad1=$((max_widths[0] - $(display_width "$col1"))); col1+=$(printf "%*s" $pad1 "")
+      local col2="$owner"; local pad2=$((max_widths[1] - $(display_width "$col2"))); col2+=$(printf "%*s" $pad2 "")
+      local col3="$users"; local pad3=$((max_widths[2] - $(display_width "$col3"))); col3+=$(printf "%*s" $pad3 "")
+      echo -e "$col1 | $col2 | $col3"
+    done
+    
+    echo -e "\033[1;34m$separator\033[0m"
   fi
 
-  echo -e "\033[1;34m----------------------------------------------------------------------\033[0m"
+  # 任務完成後，立即刪除輔助函式
+  unset -f display_width
 
-  # 查詢完全沒有任何資料庫 CONNECT 權限的非系統用戶
+  # --- 處理孤立用戶 (這部分邏輯不變，只是格式化輸出) ---
   local orphan_users_query="
-    SELECT r.rolname
-    FROM pg_roles r
-    WHERE r.rolcanlogin = true
-      AND r.rolname NOT LIKE 'pg_%'
-      AND r.rolname != 'postgres'
-      AND NOT EXISTS (
-        SELECT 1 FROM pg_database d
-        WHERE d.datistemplate = false
-          AND d.datname <> 'postgres'
-          AND has_database_privilege(r.rolname, d.datname, 'CONNECT')
-      )
-    ORDER BY r.rolname;
+    SELECT r.rolname FROM pg_roles r
+    WHERE r.rolcanlogin = true AND r.rolname NOT LIKE 'pg_%' AND r.rolname != 'postgres'
+    AND NOT EXISTS (
+      SELECT 1 FROM pg_database d WHERE d.datistemplate = false AND d.datname <> 'postgres'
+      AND has_database_privilege(r.rolname, d.datname, 'CONNECT')
+    ) ORDER BY r.rolname;
   "
-
   local orphan_users=$("${PSQL_CMD[@]}" -t -A -c "$orphan_users_query")
 
   if [ -n "$orphan_users" ]; then
-    local user_list=$(echo "$orphan_users" | paste -sd ", " -)
-    echo -e "${YELLOW}未配置任何資料庫 CONNECT 權限的用戶：${RESET}${user_list}"
+    echo -e "\n${RED}警告：以下用戶沒有任何資料庫 CONNECT 權限：${RESET}"
+    echo "$orphan_users" | while read -r user; do
+      echo -e "${RED}- ${user}${RESET}"
+    done
+    echo
   fi
-  echo
 }
 setup_dba_command() {
   local dba_path="/usr/local/bin/dba"
@@ -1489,12 +1555,29 @@ setup_dba_command() {
 }
 
 show_mysql_info() {
-  echo -e "\n${CYAN}目 前 資 料 庫 與 用 戶 狀 態 ：${RESET}"
-  echo -e "\033[1;34m----------------------------------------------------------------------\033[0m"
-  printf "%-25s | %-40s\n" "資 料 庫 名 稱" "可 存 取 用 戶"
-  echo -e "\033[1;34m----------------------------------------------------------------------\033[0m"
+  # --- 排版輔助函式 (處理中英文對齊) ---
+  display_width() {
+    local str="$1"
+    # 先移除 ANSI 顏色代碼，再計算寬度
+    local clean_str=$(echo -e "$str" | sed "s/\x1B\[[0-9;]*[mK]//g")
+    local width=0
+    local i=0
+    while [ $i -lt ${#clean_str} ]; do
+      local char="${clean_str:$i:1}"
+      if [[ $(printf "%d" "'$char") -gt 127 ]] 2>/dev/null; then
+        width=$((width + 2))
+      else
+        width=$((width + 1))
+      fi
+      i=$((i + 1))
+    done
+    echo $width
+  }
 
-  # 撈自訂資料庫清單（排除系統庫）
+  echo -e "\n${CYAN}目 前 資 料 庫 與 用 戶 狀 態 ：${RESET}"
+
+  # --- 階段一：收集所有需要顯示的資料 ---
+
   local all_dbs
   all_dbs=$("${MYSQL_CMD[@]}" -N -e "
     SELECT schema_name
@@ -1502,7 +1585,6 @@ show_mysql_info() {
     WHERE schema_name NOT IN ('mysql','information_schema','performance_schema','sys');
   ")
 
-  # 撈出授權對應表：資料庫 -> 使用者（GROUP_CONCAT 組成一行）
   declare -A db_has_user
   while IFS=$'\t' read -r db users; do
     db_has_user["$db"]="$users"
@@ -1513,19 +1595,90 @@ show_mysql_info() {
     GROUP BY db;
   ")
 
+  local -a data_rows
   if [ -z "$all_dbs" ]; then
     echo -e "${YELLOW}  尚 無 自 訂 資 料 庫。${RESET}"
   else
-    echo "$all_dbs" | sed '/^\s*$/d' | while read -r db; do
-      if [[ -z "${db_has_user["$db"]}" || "${db_has_user["$db"]}" == "NULL" ]]; then
-        printf "${RED}%-25s | 無任何授權 (孤立資料庫)${RESET}\n" "$db"
+    # *** 核心修正：使用進程替換 (Process Substitution) ***
+    # 這樣 while 迴圈就在當前 Shell 中執行，data_rows 才能被正確賦值
+    while read -r db; do
+      local users="${db_has_user["$db"]}"
+      if [[ -z "$users" || "$users" == "NULL" ]]; then
+        data_rows+=("$db|${RED}無任何授權 (孤立資料庫)${RESET}")
       else
-        printf "%-25s | %s\n" "$db" "${db_has_user["$db"]}"
+        data_rows+=("$db|$users")
       fi
-    done
+    done < <(echo "$all_dbs" | sed '/^\s*$/d') 
+  fi
+  
+  # 如果沒有任何自訂資料庫，後續的渲染就不需要執行
+  if [ ${#data_rows[@]} -eq 0 ] && [ -n "$all_dbs" ]; then
+      # 這種情況很少見，但以防萬一
+      echo -e "${YELLOW}  無法解析資料庫列表。${RESET}"
+      return
+  elif [ ${#data_rows[@]} -eq 0 ]; then
+      # 這是沒有資料庫的正常情況，前面已經提示過，直接結束
+      return
   fi
 
-  # 查找沒有任何授權的孤立用戶（user@host 格式）
+
+  # --- 階段二：計算各欄位的最大寬度 ---
+
+  local headers=("資 料 庫 名 稱" "可 存 取 用 戶")
+  local -a max_widths=()
+  max_widths[0]=$(display_width "${headers[0]}")
+  max_widths[1]=$(display_width "${headers[1]}")
+
+  for row in "${data_rows[@]}"; do
+    IFS='|' read -r db users <<< "$row"
+    local db_width=$(display_width "$db")
+    local users_width=$(display_width "$users")
+
+    if [[ $db_width -gt ${max_widths[0]} ]]; then
+      max_widths[0]=$db_width
+    fi
+    if [[ $users_width -gt ${max_widths[1]} ]]; then
+      max_widths[1]=$users_width
+    fi
+  done
+
+  # --- 階段三：根據計算好的寬度，格式化輸出 ---
+
+  local total_width=$((max_widths[0] + max_widths[1] + 3)) # +3 for " | "
+  local separator
+  separator=$(printf '%.0s-' $(seq 1 $total_width))
+  
+  echo -e "\033[1;34m$separator\033[0m"
+  
+  # 輸出標頭
+  local header_col1="${headers[0]}"
+  local header_col1_padding=$((max_widths[0] - $(display_width "$header_col1")))
+  header_col1+=$(printf "%*s" $header_col1_padding "")
+  
+  local header_col2="${headers[1]}"
+  local header_col2_padding=$((max_widths[1] - $(display_width "$header_col2")))
+  header_col2+=$(printf "%*s" $header_col2_padding "")
+  
+  echo -e "$header_col1 | $header_col2"
+  echo -e "\033[1;34m$separator\033[0m"
+
+  # 輸出資料
+  for row in "${data_rows[@]}"; do
+    IFS='|' read -r db users <<< "$row"
+    
+    local col1="$db"
+    local col1_padding=$((max_widths[0] - $(display_width "$col1")))
+    col1+=$(printf "%*s" $col1_padding "")
+    
+    local col2="$users"
+    local col2_padding=$((max_widths[1] - $(display_width "$col2")))
+    col2+=$(printf "%*s" $col2_padding "")
+    
+    echo -e "$col1 | $col2"
+  done
+  unset -f display_width
+
+  # --- 處理孤立用戶 (邏輯不變) ---
   local orphan_users
   orphan_users=$("${MYSQL_CMD[@]}" -N -e "
     SELECT CONCAT(user, '@', host)
@@ -1546,7 +1699,7 @@ show_mysql_info() {
     done
   fi
 
-  echo -e "\033[1;34m----------------------------------------------------------------------\033[0m"
+  echo -e "\033[1;34m$separator\033[0m"
   echo
 }
 
@@ -1664,12 +1817,10 @@ show_menu(){
     echo -e "\033[1;34m--------------\033[0m"
     if [ $db_mode = mysql ]; then
       echo "10. 解除安裝MySQL"
-      echo ""
       echo "11. 安裝及管理PostgreSQL"
       echo "12. 安裝管理工具phpmyadmin（須有docker和超級用戶）"
     elif [ $db_mode = pgsql ]; then
       echo "10. 解除安裝PostgreSQL"
-      echo ""
       echo "11. 安裝及管理MySQL"
       echo "12. 安裝管理工具pgweb（須有docker和超級用戶）"
     fi
