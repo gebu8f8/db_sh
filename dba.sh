@@ -7,7 +7,7 @@ YELLOW='\033[1;33m'  # 警告用黃色
 CYAN='\033[0;36m'    # 一般提示用青色
 RESET='\033[0m'      # 清除顏色
 
-version="4.0.8"
+version="4.1.0"
 
 # 檢查是否以root權限運行
 if [ "$(id -u)" -ne 0 ]; then
@@ -15,8 +15,23 @@ if [ "$(id -u)" -ne 0 ]; then
   if command -v sudo >/dev/null 2>&1; then
     exec sudo "$0" "$@"
   else
-    echo "無sudo指令"
-    exit 1
+    install_sudo_cmd=""
+    if command -v apt >/dev/null 2>&1; then
+      install_sudo_cmd="apt-get update && apt-get install -y sudo"
+    elif command -v yum >/dev/null 2>&1; then
+      install_sudo_cmd="yum install -y sudo"
+    elif command -v apk >/dev/null 2>&1; then
+      install_sudo_cmd="apk add sudo"
+    else
+      echo "無sudo指令"
+      sleep 1
+      exit 1
+    fi
+    su -c "$install_sudo_cmd"
+    if [ $? -eq 0 ] && command -v sudo >/dev/null 2>&1; then
+      echo "sudo指令已經安裝成功，請等下輸入您的密碼"
+      exec sudo "$0" "$@"
+    fi
   fi
 fi
 
@@ -34,382 +49,292 @@ check_system(){
   fi
 }
 
-#是否有安裝mysql
-check_mysql(){
-  if command -v mysql >/dev/null 2>&1 || command -v mariadb >/dev/null 2>&1; then
-    get_mysql_command
-    db_mode=mysql
-  else
-    echo -e "${YELLOW}未安裝MariaDB/MySQL，請先安裝！${RESET}"
-    exit 1
-  fi
+check_cli_db(){
+  local input=$1
+  declare -A db=(
+    ["mysql"]="MariaDB/MySQL"
+    ["psql"]="PostgreSQL"
+  )
+
+  case $input in
+  mysql)
+    if command -v mysql >/dev/null 2>&1 || command -v mariadb >/dev/null 2>&1; then
+      get_mysql_command
+      db_mode=mysql
+      return
+    fi
+    ;;
+  psql)
+    if command -v psql >/dev/null 2>&1; then
+      db_mode=pgsql
+      get_postgres_command
+      return
+    fi
+    ;;
+  esac
+  echo -e "${YELLOW}未安裝${db[$input]}，請先安裝！${RESET}"
 }
 
-check_pgsql(){
-  if command -v psql >/dev/null 2>&1; then
-    db_mode=pgsql
-    get_postgres_command
-  else
-    echo -e "${YELLOW}未安裝PostgreSQL，請先安裝！${RESET}"
-    exit 1
-  fi
-}
 
 # 檢查無安裝內容
 check_app(){
-  if ! command -v sudo >/dev/null 2>&1; then
-    case $system in
-    1)
-      apt install sudo -y
-      ;;
-    2)
-      yum install sudo -y
-      ;;
-    3)
-      apk add sudo
-      ;;
-    esac
+  declare -A pkg_map=(
+    ["sudo"]="sudo"
+    ["wget"]="wget"
+    ["jq"]="jq"
+  )
+  if [ $system -eq 2 ]; then
+    if ! yum repolist enabled | grep -q "epel"; then
+      yum install -y epel-release
+    fi
   fi
-  if ! command -v wget  >/dev/null 2>&1; then
-    case $system in
-    1)
-      apt update
-      apt install wget -y
-      ;;
-    2)
-      yum update
-      yum install -y wget
-      ;;
-    3)
-      apk update
-      apk add wget
-      ;;
-    esac
-  fi
-  if ! command -v jq >/dev/null 2>&1; then
-    case $system in
-    1)
-      apt update
-      apt install jq -y
-      ;;
-    2)
-      yum update
-      yum install jq -y
-      ;;
-    3)
-      apk update
-      apk add jq
-      ;;
-    esac
-  fi
-}
-# 檢查是否安裝PostgreSQL
-check_db(){
-  pg=false
-  mysql=false
-  if command -v psql >/dev/null 2>&1; then
-    pg=true
-  fi
-  if command -v mysql >/dev/null 2>&1 || command -v mariadb >/dev/null 2>&1; then
-    mysql=true
-  fi
-  if [[ $pg = true && $mysql = true ]]; then
-    choice_db_menu
-  elif [[ $pg = false && $mysql = true ]]; then
-    get_mysql_command
-    db_mode=mysql
-    show_menu
-  elif [[ $pg = true && $mysql = false ]]; then
-    get_postgres_command
-    db_mode=pgsql
-    show_menu
-  elif [[ $pg = false && $mysql = false ]]; then
-    install_menu
-  fi
+  for cmd in "${!pkg_map[@]}"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      pkg="${pkg_map[$cmd]}"
+      case "$system" in
+      1) apt update -qq && apt install -y "$pkg" ;;
+      2) yum update && yum install -y "$pkg" ;;
+      esac
+    fi
+  done
   
 }
+check_db() {
+  count=0
+  pg=false
+  mysql=false
 
-deploy_db_admin_ui() {
+  if command -v psql >/dev/null 2>&1; then
+    pg=true
+    ((count++))
+  fi
+
+  if command -v mysql >/dev/null 2>&1 || command -v mariadb >/dev/null 2>&1; then
+    mysql=true
+    ((count++))
+  fi
+
+  case $count in
+    0)
+      install_menu
+      ;;
+    1)
+      if [[ $pg = true ]]; then
+        get_postgres_command
+        db_mode=pgsql
+      else
+        get_mysql_command
+        db_mode=mysql
+      fi
+      show_menu
+      ;;
+    *)
+      choice_db_menu
+      ;;
+  esac
+}
+deploy_webui() {
+  setup_reverse_proxy() {
+    local port="$1"
+    local confirm=""
+    
+    read -p "是否使用反向代理？（Y/n）" confirm
+
+    if ! command -v site >/dev/null 2>&1; then
+      return 1
+    fi
+    confirm=${confirm,,}
+    if [[ "$confirm" = "y" || "$confirm" = "" ]]; then
+      read -p "請輸入域名：" domain
+      if site setup "$domain" proxy "127.0.0.1" "http" "$port"; then
+        return $?
+      fi
+    fi
+  }
   local db_host="172.17.0.1"
   local mysql_port=3306
   local pgsql_port=5432
   local ui_user="admin"
   local ui_pass="$(openssl rand -base64 12 | tr -dc A-Za-z0-9)"
-  local confirm=""
   local port=""
-  local pg_user=""
-  local pg_pass=""
+  local confirm
 
-  # 檢查 docker 是否存在
+  # 檢查 docker
   if ! command -v docker &>/dev/null; then
     echo -e "${RED}Docker 未安裝，請先安裝 Docker。${RESET}"
     return 1
   fi
-  if command -v ufw >/dev/null 2>&1 || command -v firewall-cmd >/dev/null 2>&1; then
-    echo "跳過開放容器能連結宿主機。"
-  elif command -v iptables >/dev/null 2>&1; then
-    case $system in
-    1)
-      if ! command -v netfilter-persistent >/dev/null 2>&1; then
-        apt update
-        apt install -y iptables-persistent
-        systemctl enable netfilter-persistent
-      fi
-      ;;
-    2)
-      if ! systemctl list-unit-files | grep iptables > /dev/null 2>&1; then
-        yum update -y
-        yum install -y iptables-services
-        systemctl enable iptables
-      fi
-      ;;
-    3)
-      if ! rc-service iptables status > /dev/null 2>&1; then
-        apk update
-        apk add iptables
-        rc-update add iptables
-      fi
-      ;;
-    esac
-    if ! iptables -C INPUT -i docker0 -j ACCEPT > /dev/null 2>&1; then
-      iptables -I INPUT -i docker0 -j ACCEPT
-    fi
-    case $system in
-    1)
-      netfilter-persistent save
-      ;;
-    2)
-      service iptables save
-      ;;
-    3)
-      /etc/init.d/iptables save
-      ;;
-    esac
-    echo -e "${GREEN}已添加可讓docker容器連入宿主機的防火牆規則${RESET}"
-    sleep 2
-  fi
+
+  # 隨機端口
   while true; do
     read -r -p "請輸入數據庫管理映射端口（留空自動隨機）:" port
     if [[ -z "$port" ]]; then
-      local port=$(( ( RANDOM % (65535 - 1025) ) + 1025 ))
+      port=$(( ( RANDOM % (65535 - 1025) ) + 1025 ))
       echo -e "${CYAN}自動選擇隨機端口：$port${RESET}"
     fi
-    if ss -tuln | awk '{print $5}' | grep -qE ":$port\$"; then
-      echo -e  "${YELLOW}端口 $port 已被佔用，請重新輸入！${RESET}"
-    else
-      break
-    fi
+    ss -tuln | awk '{print $5}' | grep -qE ":$port$" \
+      && echo -e "${YELLOW}端口 $port 已被佔用，請重新輸入！${RESET}" \
+      || break
   done
-  if [ "$db_mode" = "mysql" ]; then
-    echo -e "${CYAN}檢查 phpMyAdmin 是否已存在...${RESET}"
-    if docker ps -a --format '{{.Names}}' | grep -q "^phpmyadmin$"; then
-      echo -e "${YELLOW}phpMyAdmin 容器已存在，跳過建立。${RESET}"
-    else
-      echo -e "${CYAN}創建 phpMyAdmin...${RESET}"
-      if command -v site >/dev/null 2>&1; then
-        read -p "是否使用反向代理？（Y/n）" confirm
-        confirm=${confirm,,}
-        if [[ "$confirm" = "y" || "$confirm" = "" ]]; then
-          read -p "請輸入域名：" domain
-          if site setup $domain proxy "127.0.0.1" "http" "$port"; then
-            docker run -d \
-              --restart always \
-              --name phpmyadmin \
-              -p $port:80 \
-              -e PMA_HOST=$db_host \
-              -e PMA_PORT=$mysql_port \
-              -e PMA_ABSOLUTE_URI=https://$domain \
-              phpmyadmin/phpmyadmin
-            echo -e "${GREEN}phpMyAdmin 已創建於 https://$domain${RESET}" 
-            return 0
-          fi
-        fi
-      fi
-      docker run -d \
-        --name phpmyadmin \
-        -e PMA_HOST="$db_host" \
-        -e PMA_PORT="$mysql_port" \
-        -p "$port":80 \
-        phpmyadmin/phpmyadmin
-      echo -e "${GREEN}phpMyAdmin 已啟動於 http://localhost:$port${RESET}"
-      read -p "請按任意鍵繼續..." -n1; echo
-    fi
+  if [[ "$db_mode" = "mysql" ]]; then
+    if ! docker ps -a --format '{{.Names}}' | grep -q "^phpmyadmin$"; then
+      
+      local extra_env=""
 
-  elif [ "$db_mode" = "pgsql" ]; then
-    echo -e "${CYAN}檢查 adminer 是否已存在...${RESET}"
-    if docker ps -a --format '{{.Names}}' | grep -q "^adminer$"; then
-      echo -e "${YELLOW}adminer 容器已存在，跳過建立。${RESET}"
-    else
-      echo -e "${CYAN}啟動 adminer...${RESET}"
-      docker run -d --restart always --name adminer -p $port:8080 adminer
-      if command -v site >/dev/null 2>&1; then
-        read -p "是否執行反向代理？（Y/n）" confirm
-        confirm=${confirm,,}
-        if [[ "$confirm" == y || $confirm == "" ]]; then
-          read -p "請輸入您的域名：" domain
-          if site setup $domain proxy "127.0.0.1" "http" "$port"; then
-            echo -e "${GREEN}adminer 已開啟於 http://$domain${RESET}"
-            echo "主機名稱:172.17.0.1"
-            read -p "請按任意鍵繼續..." -n1; echo
-          fi
+      read -p "是否使用反向代理[Y/n](Default:N) " confirm
+      confirm=${confirm,,}
+
+      if [[ "$confirm" == "y" ]]; then
+        if setup_reverse_proxy $port; then
+          extra_env="-e PMA_ABSOLUTE_URI=https://$domain"
+        else
+          domain=""
         fi
       fi
-      echo -e "${GREEN} adminer 已開啟於 http://localhost:$port${RESET}"
-      echo "主機名稱:172.17.0.1"
-      read -p "請按任意鍵繼續..." -n1; echo
+
+      docker run -d --restart always --name phpmyadmin -p "$port":80 -e PMA_HOST="$db_host" -e PMA_PORT="$mysql_port" $extra_env phpmyadmin/phpmyadmin
+
+      if [[ -n "$domain" ]]; then
+        echo -e "${GREEN}phpMyAdmin 已創建於 https://$domain${RESET}"
+      else
+        echo -e "${GREEN}phpMyAdmin 已啟動於 http://localhost:$port${RESET}"
+      fi
+      sleep 5
+    fi
+  elif [[ "$db_mode" = "pgsql" ]]; then
+
+    if ! docker ps -a --format '{{.Names}}' | grep -q "^adminer$"; then
+      docker run -d \
+        --restart always \
+        --name adminer \
+        -p $port:8080 \
+        adminer
+
+      setup_reverse_proxy "$port"
+
+      if [[ -n "$domain" ]]; then
+        echo -e "${GREEN}Adminer 已啟動於 http://$domain${RESET}"
+      else
+        echo -e "${GREEN}Adminer 已啟動於 http://localhost:$port${RESET}"
+      fi
+      echo "主機名稱: $db_host"
+      read -p "操作完成，請按任意鍵繼續..." -n1
     fi
   fi
+  unset domain
+  unset setup_reverse_proxy
 }
+
 
 
 # 全域變數 MYSQL_CMD（陣列）將會被設定為 mysql 指令
 MYSQL_CMD=()
 
 get_mysql_command() {
-    # 如果 MYSQL_CMD 已經設定，就直接返回
-    if [ ${#MYSQL_CMD[@]} -gt 0 ]; then
-        return 0
+  if [ ${#MYSQL_CMD[@]} -gt 0 ]; then
+    return 0
+  fi
+  local mysql_root_pw=""
+  local pass_file="/etc/mysql-pass.conf"
+  local cmd=""
+  local attempt=0
+  local max_attempts=5
+
+  # 優先使用 mariadb 指令
+  if command -v mariadb >/dev/null 2>&1; then
+    cmd="mariadb"
+  elif command -v mysql >/dev/null 2>&1; then
+    cmd="mysql"
+  fi
+
+  # 嘗試無密碼登入
+  if $cmd -u root -e "SELECT 1;" &>/dev/null; then
+    MYSQL_CMD=("$cmd" "-u" "root")
+    return 0
+  fi
+
+  # 嘗試讀取 /etc/mysql-pass.conf
+  if [ -f "$pass_file" ]; then
+    mysql_root_pw=$(< "$pass_file")
+    if $cmd -u root -p"$mysql_root_pw" -e "SELECT 1;" &>/dev/null; then
+      MYSQL_CMD=("$cmd" "-u" "root" "-p$mysql_root_pw")
+      return 0
+    fi
+  fi
+
+  # 不存在 conf 或無效，請使用者輸入
+  while true; do
+    read -s -p "請輸入 MySQL root 密碼：" mysql_root_pw
+    echo
+    attempt=$((attempt + 1))
+
+    if [ -z "$mysql_root_pw" ]; then
+      echo -e "${YELLOW}密碼不能為空，請再試一次。${RESET}"
+      continue
     fi
 
-    local mysql_root_pw=""
-    local pass_file="/etc/mysql-pass.conf"
-    local cmd=""
-
-    # 優先使用 mariadb 指令
-    if command -v mariadb >/dev/null 2>&1; then
-        cmd="mariadb"
-    elif command -v mysql >/dev/null 2>&1; then
-        cmd="mysql"
+    if $cmd -u root -p"$mysql_root_pw" -e "SELECT 1;" &>/dev/null; then
+      echo "$mysql_root_pw" > "$pass_file"
+      chmod 600 "$pass_file"
+      echo -e "${GREEN}已將 root 密碼寫入 $pass_file (權限 600)${RESET}"
+      MYSQL_CMD=("$cmd" "-u" "root" "-p$mysql_root_pw")
+      return 0
     else
-        echo -e "${RED}系統未安裝 mariadb 或 mysql${RESET}"
-        exit 1
+      echo -e "${RED}密碼錯誤，請再試一次。${RESET}"
     fi
 
-    # 嘗試無密碼登入
-    if $cmd -u root -e "SELECT 1;" &>/dev/null; then
-        MYSQL_CMD=("$cmd" "-u" "root")
-        return 0
+    if [ $attempt -ge $max_attempts ]; then
+      echo -e "${RED}已達最大嘗試次數 ($max_attempts)，程式退出。${RESET}"
+      exit 1
     fi
-
-    # 嘗試讀取 /etc/mysql-pass.conf
-    if [ -f "$pass_file" ]; then
-        mysql_root_pw=$(< "$pass_file")
-        if $cmd -u root -p"$mysql_root_pw" -e "SELECT 1;" &>/dev/null; then
-            MYSQL_CMD=("$cmd" "-u" "root" "-p$mysql_root_pw")
-            return 0
-        fi
-    fi
-
-    # 不存在 conf 或無效，請使用者輸入
-    while true; do
-        read -s -p "請輸入 MySQL root 密碼：" mysql_root_pw
-        echo
-        if [ -z "$mysql_root_pw" ]; then
-            echo -e "${YELLOW}密碼不能為空，請再試一次。${RESET}"
-            continue
-        fi
-
-        if $cmd -u root -p"$mysql_root_pw" -e "SELECT 1;" &>/dev/null; then
-            echo -e "${GREEN}密碼正確，已成功登入 MySQL${RESET}" 
-            echo "$mysql_root_pw" > "$pass_file"
-            chmod 600 "$pass_file"
-            echo -e "${GREEN}已將 root 密碼寫入 $pass_file (權限 600)${RESET}"
-            MYSQL_CMD=("$cmd" "-u" "root" "-p$mysql_root_pw")
-            return 0
-        else
-            echo -e "${RED}密碼錯誤，請再試一次。${RESET}"
-        fi
-    done
+  done
 }
 
-
-
-# 全域變數 PSQL_CMD 和 PGDUMP_CMD
 PSQL_CMD=()
 PGDUMP_CMD=()
 
 get_postgres_command() {
   # --- 前置檢查 (保持不變) ---
   if ! id "postgres" &>/dev/null; then
-    echo -e "${RED}找不到 postgres 系統使用者，請確認 PostgreSQL 是否已正確安裝並初始化。${RESET}"
+    echo -e "${RED}找不到 postgres 系統使用者，請確認 PostgreSQL 是否已正確安裝並初始化。${RESET}" >&2
     exit 1
   fi
-  if ! command -v sudo &>/dev/null; then
-    echo -e "${RED}系統未安裝 sudo，請先安裝 sudo 套件。${RESET}"
-    exit 1
-  fi
-  
   _filtered_sudo() {
-    # 執行真正的 sudo 命令，並將其標準錯誤(stderr)透過「程序替換」
-    # 傳遞給 grep 進行過濾，過濾後的結果再送回原始的 stderr。
-    # 這樣只會移除目標警告，而保留其他所有真正的錯誤訊息。
     sudo "$@" 2> >(grep -v "unable to resolve host" >&2)
   }
-  # 將這個內部函式匯出，確保它在所有地方都可被呼叫
   export -f _filtered_sudo
 
-  # --- 重新定義你的三個全域變數 ---
-  # 注意看：我們只是把陣列的第一個元素 "sudo" 換成了 "_filtered_sudo"
-  # 其他所有參數都保持原樣！
   PSQL_CMD=("_filtered_sudo" "-iu" "postgres" "psql" "-q" "-t" "-A")
   PSQL_EXEC_CMD=("_filtered_sudo" "-iu" "postgres" "psql" "-c")
   PGDUMP_CMD=("_filtered_sudo" "-iu" "postgres" "pg_dump")
-  
   return 0
 }
 
-enable_postgres_user_external_access() {
+postgres_external_access() {
   local username=$1
   
-  echo -e "${CYAN}正在設定 listen_addresses = '*'...${RESET}" >&2
-
   local conf_file=$(_filtered_sudo -iu postgres psql -tAc "SHOW config_file;")
   local hba_file=$(_filtered_sudo -iu postgres psql -tAc "SHOW hba_file;")
-
-  if [ ! -f "$conf_file" ] || [ ! -f "$hba_file" ]; then
-    echo -e "${RED}找不到 PostgreSQL 設定檔，無法繼續。${RESET}"
-    return 1
-  fi
-
-  # 處理 listen_addresses 設定（略過註解行，並更新不為 '*' 的有效設定）
-  # 強制設為 listen_addresses = '*'
   if grep -P "^\s*listen_addresses\s*=\s*'\*'" "$conf_file" >/dev/null; then
     echo -e "${GREEN}listen_addresses 已正確設定為 '*'。${RESET}" >&2
   else
-    echo -e "${YELLOW}正在強制設為 listen_addresses = '*'...${RESET}" >&2
-
-    # 若已有 listen_addresses 設定（不論是否註解），統一替換為有效設定
     if grep -P "^\s*#?\s*listen_addresses\s*=" "$conf_file" >/dev/null; then
       sed -i -E "s|^\s*#?\s*listen_addresses\s*=.*|listen_addresses = '*'|" "$conf_file"
     else
-    # 若完全沒有該設定，則直接加在檔案結尾
       echo "listen_addresses = '*'" >> "$conf_file"
     fi
-
-    echo -e "${CYAN}已更新 listen_addresses 為 '*'，重新啟動 PostgreSQL...${RESET}" >&2
     service postgresql restart
   fi
-
-  # 加入 pg_hba.conf 條目
-  if grep -E "host\s+all\s+$username\s+0\.0\.0\.0/0\s+md5" "$hba_file" >/dev/null; then
-    echo -e "${YELLOW}該用戶 '$username' 已允許外部訪問，無需重複添加。${RESET}" >&2
-  else
+  if ! grep -E "host\s+all\s+$username\s+0\.0\.0\.0/0\s+md5" "$hba_file" >/dev/null; then
     echo "host all $username 0.0.0.0/0 md5" >> "$hba_file"
     echo -e "${GREEN}已加入 '$username' 的外部訪問條目至 pg_hba.conf。${RESET}" >&2
   fi
-
   echo -e "${GREEN}已成功開放 '$username' 從外部網路登入 PostgreSQL。${RESET}" >&2
   access_mode=外網
 }
 
-revoke_user_external_access() {
+postgres_revoke_external_access() {
   local username="$1"
-  if [[ -z "$username" ]]; then
-    echo "請提供使用者名稱！"
-    return 1
-  fi
-
-  echo "檢查是否存在外網訪問規則：$username"
 
   # 取得 pg_hba.conf 路徑
   local hba_file=$(_filtered_sudo -iu postgres psql -tAc "SHOW hba_file;")
@@ -424,7 +349,6 @@ revoke_user_external_access() {
 
   # 檢查是否有針對此用戶的 0.0.0.0/0 或 ::/0 host 規則
   if grep -qE "^[[:space:]]*host[[:space:]]+all[[:space:]]+$username[[:space:]]+(0\.0\.0\.0/0|::/0)" "$hba_file"; then
-    echo -e "${CYAN}發現規則，正在移除...${RESET}"
     # 移除該條目
     sed -i "/^[[:space:]]*host[[:space:]]\+all[[:space:]]\+$username[[:space:]]\+\(0\.0\.0\.0\/0\|::\/0\)/d" "$hba_file"
         
@@ -484,7 +408,7 @@ create_database() {
     fi
     allow_remote=${allow_remote,,}
     if [[ "$allow_remote" == "y" ]]; then
-      enable_postgres_user_external_access "$username"
+      postgres_external_access "$username"
       host="外網"
     fi
   fi
@@ -563,7 +487,6 @@ remove_database() {
     read -p "是否刪除此資料庫的用戶? (y/n) " choice
     fi
     if [ "$choice" = "y" ]; then
-      echo -e "${CYAN}正在尋找與 $dbs_to_delete 資料庫相關的用戶...${RESET}" >&2
       local users=$("${MYSQL_CMD[@]}" -N -e "SELECT user, host FROM mysql.db WHERE db = '$dbs_to_delete';")
       if [ -z "$users" ]; then
         echo -e "${YELLOW}找不到任何與 $dbname 資料庫相關的用戶。${RESET}" >&2
@@ -571,26 +494,21 @@ remove_database() {
         return 1
       else
         echo "$users" | while read user host; do
-          echo -e "${CYAN}正在刪除用戶 '$user'@'$host'...${RESET}" >&2
           "${MYSQL_CMD[@]}" -e "DROP USER IF EXISTS '$user'@'$host';" >&2
         done
       fi
-    else
-      echo -e "${CYAN}跳過刪除用戶。${RESET}"  >&2
     fi
-    echo -e "${CYAN}正在刪除資料庫 $dbname...${RESET}" >&2
     "${MYSQL_CMD[@]}" -e "DROP DATABASE IF EXISTS \`$dbname\`;"
     echo -e "${GREEN}資料庫 $dbname 已刪除。${RESET}" >&2
     return 0
   fi
-  get_postgres_command
   if [ $cli_mode = false ]; then
     local dbs_to_delete=$("${PSQL_CMD[@]}" -c "SELECT datname FROM pg_database WHERE datistemplate = false AND datname <> 'postgres';")
 
     if [ -z "$dbs_to_delete" ]; then
       echo -e "${YELLOW}目前沒有可供刪除的自訂資料庫。${RESET}" >&2
       sleep 2
-      return
+      return 0
     fi
 
     echo -e "${CYAN}可刪除的資料庫列表：${RESET}"
@@ -615,7 +533,6 @@ remove_database() {
       local db_to_delete="${db_array[$((i-1))]}"
       echo -e "\n${YELLOW}--- 準備刪除資料庫: $db_to_delete ---${RESET}" >&2
 
-      # 步驟 1: 在刪除資料庫前，先找出所有關聯的用戶 (擁有者 + 可存取者)
       local user_query="
         SELECT rolname FROM pg_roles WHERE rolname IN (
           SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = '$db_to_delete'
@@ -632,21 +549,18 @@ remove_database() {
 
         # 如果有關聯用戶，逐一詢問是否刪除
         if [ -n "$associated_users" ]; then
-          echo -e "${CYAN}接下來，將處理與該資料庫關聯的用戶...${RESET}" >&2
           for user in "${associated_users[@]}"; do
             if [ -z "$confirm_user" ]; then
               read -p "是否要一併刪除關聯用戶 '$user'？ (y/n) " confirm_user
             fi
             if [[ "$confirm_user" =~ ^[Yy]$ ]]; then
-              revoke_user_external_access "$user"
+              postgres_revoke_external_access "$user"
               "${PSQL_EXEC_CMD[@]}" "REASSIGN OWNED BY \"$user\" TO postgres; DROP OWNED BY \"$user\";" >/dev/null
               if "${PSQL_EXEC_CMD[@]}" "DROP ROLE \"$user\";"; then
                 echo -e "${GREEN}使用者 '$user' 已成功刪除。${RESET}" >&2
               else
                 echo -e "${RED}刪除使用者 '$user' 失敗！可能是因為該使用者還擁有其他資源。${RESET}" >&2
               fi
-            else
-              echo -e "${YELLOW}已保留使用者 '$user'。${RESET}" >&2
             fi
           done
         fi
@@ -668,6 +582,7 @@ add_user() {
   access_mode=localhost
   local host=""
   local host_desc=""
+  local info_desc=""   # <--- 新增：統一顯示描述
 
   read -p "請輸入用戶名稱：" raw_username
   username=$(sanitize_name "$raw_username")
@@ -676,6 +591,8 @@ add_user() {
     echo -e "${RED}用戶名稱不可為空或含非法字元！${RESET}"
     return 1
   fi
+
+  # 密碼輸入流程
   while true; do
     read -s -p "請輸入用戶密碼（留空則自動生成）：" password
     echo
@@ -687,51 +604,50 @@ add_user() {
     else
       read -s -p "請再次輸入用戶密碼：" password2
       echo
-      if [ "$password" != "$password2" ]; then
-        echo -e "${RED}密碼不一致，請重新輸入。${RESET}"
-      else
-        break
-      fi
+      [[ "$password" != "$password2" ]] \
+        && echo -e "${RED}密碼不一致，請重新輸入。${RESET}" \
+        || break
     fi
   done
-  if [ $db_mode = mysql ]; then
+
+  # MySQL 區域
+  if [ "$db_mode" = mysql ]; then
     read -p "是否允許外網訪問此用戶？(y/n) " remote
 
     if [[ "$remote" =~ ^[Yy]$ ]]; then
       host='%'
-      host_desc="外網"
+      info_desc="MySQL：外網"
     else
-      host='localhost'
-      host_desc="本地"
+      host="localhost"
+      info_desc="MySQL：本地"
     fi
 
     "${MYSQL_CMD[@]}" -e "CREATE USER IF NOT EXISTS '$username'@'$host' IDENTIFIED BY '$password';"
     "${MYSQL_CMD[@]}" -e "FLUSH PRIVILEGES;"
+  else
+    # PostgreSQL 區域
+    if "${PSQL_CMD[@]}" -c "SELECT 1 FROM pg_roles WHERE rolname='$username'" | grep -q 1; then
+      echo -e "${RED}使用者 $username 已存在！${RESET}"
+      return 1
+    fi
 
-    echo -e "${GREEN}用戶已建立${RESET}"
-    echo "用戶名稱：$username"
-    echo "用戶密碼：$password"
-    echo "主機地址：$host_desc"
-    echo
-    echo -e "${YELLOW}請記下用戶名稱、用戶密碼，以便後續使用。${RESET}"
-    return
-  fi
-  if "${PSQL_CMD[@]}" -c "SELECT 1 FROM pg_roles WHERE rolname='$username'" |   grep -q 1; then
-    echo -e "${RED}使用者 $username 已存在！${RESET}"
-    return 1
-  fi
-  
+    "${PSQL_EXEC_CMD[@]}" "CREATE USER \"$username\" WITH PASSWORD '$password';"
 
-  "${PSQL_EXEC_CMD[@]}" "CREATE USER \"$username\" WITH PASSWORD '$password';"
-  read -p "是否開放此用戶外網訪問？（Y/n）？" confirm
-  confirm=${confirm,,}
-  if [[ $confirm == y || $confirm == "" ]]; then
-    enable_postgres_user_external_access $username
+    read -p "是否開放此用戶外網訪問？（Y/n）？" confirm
+    confirm=${confirm,,}
+
+    if [[ $confirm == y || $confirm == "" ]]; then
+      postgres_external_access "$username"
+      info_desc="PostgreSQL：外網"
+    else
+      info_desc="PostgreSQL：本地"
+    fi
   fi
+
   echo -e "${GREEN}用戶已建立${RESET}"
   echo "用戶名稱：$username"
   echo "用戶密碼：$password"
-  echo "類型：$access_mode"
+  echo "資料庫模式：$info_desc"
   echo
   echo -e "${YELLOW}請記下用戶名稱、用戶密碼，以便後續使用。${RESET}"
 }
@@ -754,9 +670,6 @@ remove_user() {
       echo -e "${RED}用戶 $username 不存在！${RESET}"
       return 1
     fi
-
-    echo -e "${CYAN}正在撤銷用戶 '$username' 的所有權限...${RESET}"
-
     echo "$user_hosts" | while read host; do
       # revoke
       "${MYSQL_CMD[@]}" -e "REVOKE ALL PRIVILEGES, GRANT OPTION FROM '$username'@'$host';" 2>/dev/null
@@ -778,14 +691,11 @@ remove_user() {
     return 1
   fi
 
-  echo -e "${CYAN}正在轉移用戶 '$username' 的資產...${RESET}"
   "${PSQL_EXEC_CMD[@]}" "REASSIGN OWNED BY \"$username\" TO postgres; REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM \"$username\";"
   
-  
-  echo -e "${CYAN}正在刪除用戶 '$username'...${RESET}"
   "${PSQL_EXEC_CMD[@]}" "REASSIGN OWNED BY \"$username\" TO postgres; DROP OWNED BY \"$username\";" >/dev/null
   "${PSQL_EXEC_CMD[@]}" "DROP USER IF EXISTS \"$username\";"
-  revoke_user_external_access $username
+  postgres_revoke_external_access $username
   echo -e "${GREEN}已刪除用戶 $username ${RESET}"
 }
 
@@ -850,7 +760,7 @@ create_super_user() {
         fi
       fi
       # 重啟服務
-      service mysql restart 2>/dev/null || service mariadb restart 2>/dev/null
+      (service mysql restart 2>/dev/null || service mariadb restart 2>/dev/null)
     fi
 
   elif [ "$db_mode" = "pgsql" ]; then
@@ -989,8 +899,6 @@ reset_user_password() {
 
 # 授權用戶
 grant_user() {
-  echo -e "${CYAN}正在讀取用戶與資料庫列表...${RESET}"
-
   if [ "$db_mode" == "pgsql" ]; then
     # PostgreSQL
     mapfile -t user_list < <("${PSQL_CMD[@]}" -tAc "SELECT rolname FROM pg_roles WHERE rolcanlogin AND rolname NOT IN ('postgres');")
@@ -1105,8 +1013,6 @@ export_database() {
     # 組合 mysqldump 指令
     local MYSQLDUMP_CMD=("mysqldump" "${MYSQL_CMD[@]:1}")
 
-    echo -e "${CYAN}正在匯出資料庫 '$dbname' 到 $backup_file ...${RESET}" >&2
-    
     "${MYSQLDUMP_CMD[@]}" "$dbname" > "$backup_file"
   elif [ $db_mode = pgsql ]; then
     if ! "${PSQL_CMD[@]}" -l | cut -d \| -f 1 | grep -qw "$dbname"; then
@@ -1176,7 +1082,6 @@ import_database() {
     target_dbname="${3:?請提供資料庫名稱作為第3個參數}"
     dbuser="${4:?請提供資料庫用戶名稱作為第4個參數}"
     dbpass="${5:?請提供資料庫用戶名稱作為第5個參數}"
-    echo -e "${CYAN}準備將 '${selected_file}' 匯入到資料庫 '${target_dbname}' 並建立用戶 '${dbuser}'...${RESET}" >&2
   fi
   if [ "$db_mode" = "mysql" ]; then
     # CLI 模式下建立資料庫與用戶並授權
@@ -1186,7 +1091,6 @@ import_database() {
       "${MYSQL_CMD[@]}" -e "CREATE DATABASE IF NOT EXISTS \`$target_dbname\`;" >&2
     fi
 
-    echo -e "${CYAN}正在匯入資料...${RESET}" >&2
     if "${MYSQL_CMD[@]}" "$target_dbname" < "$selected_file"; then
       echo -e "${GREEN}資料庫 '$target_dbname' 已成功從 '$selected_file' 匯入。${RESET}" >&2
     else
@@ -1201,7 +1105,6 @@ import_database() {
       if ! _filtered_sudo -iu postgres psql -lqt | cut -d \| -f 1 | grep -qw "$target_dbname"; then
         _filtered_sudo -iu postgres psql -c "CREATE DATABASE \"$target_dbname\";" >&2
       fi
-      echo -e "${CYAN}正在匯入資料...${RESET}" >&2
       if _filtered_sudo -iu postgres psql -d "$target_dbname" < "$selected_file"; then
         echo -e "${GREEN}資料庫 '$target_dbname' 已成功從 '$selected_file' 匯入。${RESET}" >&2
       else
@@ -1237,7 +1140,6 @@ uninstall_database(){
     exit 0
     ;;
   pgsql)
-    echo -e "${CYAN}正在停止 PostgreSQL 服務...${RESET}"
     (service postgresql stop 2>/dev/null || service postgresql-17 stop 2>/dev/null)
     if [ $system -eq 1 ]; then
       apt-get purge -y 'postgresql-*'
@@ -1266,12 +1168,10 @@ install_database(){
   case $type in
   mysql)
     if command -v mysql >/dev/null 2>&1 || command -v mariadb >/dev/null 2>&1; then
-      echo -e "${GREEN}已安裝 MariaDB/MySQL。${RESET}" >&2
       if [ "$cli_mode" == false ]; then
         exec dba mysql
       fi
     else
-      echo -e "${YELLOW}未安裝 MariaDB/MySQL。${RESET}" >&2
       if [[ $system -eq 1 || $system -eq 2 ]]; then
 
         # 取得 LTS 版本清單（過濾掉已 EOL），並轉成單行
@@ -1299,37 +1199,29 @@ install_database(){
           fi
         done
       fi
-
-      # Debian / Ubuntu
       if [ "$system" -eq 1 ]; then
         apt install -y curl gnupg lsb-release jq
-            curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup \
-              | sudo bash -s -- --mariadb-server-version="$mysql_ver"
-            apt update
-            apt install -y mariadb-server
-            systemctl enable mariadb
-            systemctl start mariadb
+          curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup \
+          | bash -s -- --mariadb-server-version="$mysql_ver"
+        apt update
+        apt install -y mariadb-server
+        systemctl enable mariadb
+        systemctl start mariadb
+      elif [ "$system" -eq 2 ]; then
+        yum install -y curl jq
+        curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup \
+        | bash -s -- --mariadb-server-version="$mysql_ver"
+        yum install -y MariaDB-server
+        systemctl enable mariadb
+        systemctl start mariadb
 
-        # CentOS / RHEL
-        elif [ "$system" -eq 2 ]; then
-            yum install -y curl jq
-            curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup \
-              | sudo bash -s -- --mariadb-server-version="$mysql_ver"
-            yum install -y MariaDB-server
-            systemctl enable mariadb
-            systemctl start mariadb
-
-        # Alpine
-        elif [ "$system" -eq 3 ]; then
-            apk add mariadb mariadb-client mariadb-openrc
-            rc-update add mariadb default
-            mysql_install_db --user=mysql --basedir=/usr --datadir=/var/lib/mysql
-            service mariadb start
-        fi
-
-        if [ "$cli_mode" == false ]; then
-            exec dba mysql
-        fi
+      elif [ "$system" -eq 3 ]; then
+        apk add mariadb mariadb-client mariadb-openrc
+        rc-update add mariadb default
+        mysql_install_db --user=mysql --basedir=/usr --datadir=/var/lib/mysql
+        service mariadb start
+      fi
+      [ "$cli_mode" == false ] && exec dba mysql
     fi
     ;;
   pgsql)
@@ -1403,19 +1295,14 @@ install_database(){
       fi
 
       echo -e "${GREEN}PostgreSQL 已安裝完成。${RESET}" >&2
-      if [ "$cli_mode" == false ]; then
-        exec dba pgsql
-      fi
+      [ "$cli_mode" == false ] && exec dba pgsql
     fi
     ;;
   esac
 }
 
 
-# 顯示 PostgreSQL 資料庫、擁有者、可存取使用者，以及孤立使用者
 show_postgres_info(){
-  # --- 排版輔助函式 (處理中英文對齊) ---
-  # 此函式為內部使用，使用完畢後將會被 unset
   display_width() {
     local str="$1"
     local clean_str=$(echo -e "$str" | sed "s/\x1B\[[0-9;]*[mK]//g")
@@ -1432,7 +1319,6 @@ show_postgres_info(){
     echo $width
   }
 
-  get_postgres_command
   echo -e "\n${CYAN}目 前 資 料 庫 與 用 戶 狀 態 ：${RESET}"
 
   # --- 階段一：收集所有需要顯示的資料 ---
@@ -1518,24 +1404,43 @@ show_postgres_info(){
 
   # 任務完成後，立即刪除輔助函式
   unset -f display_width
+  
+  # 所有用戶
+  local all_users_query="
+    SELECT rolname FROM pg_roles
+    WHERE rolcanlogin = true
+      AND rolname NOT LIKE 'pg_%'
+    ORDER BY rolname;
+  "
+  local all_users=$("${PSQL_CMD[@]}" -t -A -c "$all_users_query")
+
+  # 轉成同一行字符串
+  local all_users_line=$(echo "$all_users" | tr '\n' ' ' | sed 's/ $//')
+  local all_users_line=$(echo "$all_users" | tr '\n' ' ' | sed 's/ $//')
+  
+  echo -e "\n${CYAN}所 有 用 戶 列 表：${RESET}${all_users_line}"
 
   # --- 處理孤立用戶 (這部分邏輯不變，只是格式化輸出) ---
   local orphan_users_query="
     SELECT r.rolname FROM pg_roles r
-    WHERE r.rolcanlogin = true AND r.rolname NOT LIKE 'pg_%' AND r.rolname != 'postgres'
-    AND NOT EXISTS (
-      SELECT 1 FROM pg_database d WHERE d.datistemplate = false AND d.datname <> 'postgres'
-      AND has_database_privilege(r.rolname, d.datname, 'CONNECT')
-    ) ORDER BY r.rolname;
+    WHERE r.rolcanlogin = true
+      AND r.rolname NOT LIKE 'pg_%'
+      AND r.rolsuper = false
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_database d
+        WHERE d.datistemplate = false
+          AND d.datname <> 'postgres'
+          AND has_database_privilege(r.rolname, d.datname, 'CONNECT')
+      )
+    ORDER BY r.rolname;
   "
+
   local orphan_users=$("${PSQL_CMD[@]}" -t -A -c "$orphan_users_query")
 
   if [ -n "$orphan_users" ]; then
-    echo -e "\n${RED}警告：以下用戶沒有任何資料庫 CONNECT 權限：${RESET}"
-    echo "$orphan_users" | while read -r user; do
-      echo -e "${RED}- ${user}${RESET}"
-    done
-    echo
+    # 轉橫排
+    local orphan_line=$(echo "$orphan_users" | tr '\n' ' ' | sed 's/ $//')
+    echo -e "\n${RED}警告：孤立用戶（無任何資料庫 CONNECT 權限）：${RESET}${orphan_line}"
   fi
 }
 setup_dba_command() {
@@ -1599,8 +1504,6 @@ show_mysql_info() {
   if [ -z "$all_dbs" ]; then
     echo -e "${YELLOW}  尚 無 自 訂 資 料 庫。${RESET}"
   else
-    # *** 核心修正：使用進程替換 (Process Substitution) ***
-    # 這樣 while 迴圈就在當前 Shell 中執行，data_rows 才能被正確賦值
     while read -r db; do
       local users="${db_has_user["$db"]}"
       if [[ -z "$users" || "$users" == "NULL" ]]; then
@@ -1677,6 +1580,22 @@ show_mysql_info() {
     echo -e "$col1 | $col2"
   done
   unset -f display_width
+  
+  # 所有用戶
+  local all_users=$("${MYSQL_CMD[@]}" -N -e "
+    SELECT CONCAT(user, '@', host)
+    FROM mysql.user
+    WHERE user NOT IN (
+      'mysql.session', 'mysql.sys', 'debian-sys-maint', 'mysql', 'mariadb.sys'
+    )
+    ORDER BY user, host;
+  ")
+
+  if [ -n "$all_users" ]; then
+      local all_users_line
+      all_users_line=$(echo "$all_users" | tr '\n' ' ' | sed 's/ $//')
+      echo -e "${CYAN}所 有 用 戶 列 表：${RESET} ${all_users_line}"
+  fi
 
   # --- 處理孤立用戶 (邏輯不變) ---
   local orphan_users
@@ -1693,14 +1612,13 @@ show_mysql_info() {
   ")
 
   if [ -n "$orphan_users" ]; then
-    echo -e "\n${RED}警告：以下用戶沒有任何資料庫授權：${RESET}"
-    echo "$orphan_users" | while read -r user_host; do
-      echo -e "${RED}- $user_host${RESET}"
-    done
+      local orphan_line
+      orphan_line=$(echo "$orphan_users" | tr '\n' ' ' | sed 's/ $//')
+      echo -e "\n${RED}警告：孤立用戶（沒有任何資料庫授權）：${RESET} ${orphan_line}"
   fi
 
-  echo -e "\033[1;34m$separator\033[0m"
-  echo
+  #echo -e "\033[1;34m$separator\033[0m"
+  #echo
 }
 
 update_script() {
@@ -1709,7 +1627,6 @@ update_script() {
   local current_script="/usr/local/bin/dba"
   local current_path="$0"
 
-  echo "正在檢查更新..."
   wget -q "$download_url" -O "$temp_path"
   if [ $? -ne 0 ]; then
     echo -e "${RED}無法下載最新版本，請檢查網路連線。${RESET}"
@@ -1719,11 +1636,9 @@ update_script() {
   # 比較檔案差異
   if [ -f "$current_script" ]; then
     if diff "$current_script" "$temp_path" >/dev/null; then
-      echo -e "${GREEN}腳本已是最新版本，無需更新。${RESET}"
       rm -f "$temp_path"
       return
     fi
-    echo "正在更新..."
     cp "$temp_path" "$current_script" && chmod +x "$current_script"
     if [ $? -eq 0 ]; then
       echo -e "${GREEN}更新成功！將自動重新啟動腳本以套用變更...${RESET}"
@@ -1876,7 +1791,7 @@ show_menu(){
       fi
       ;;
     12)
-      deploy_db_admin_ui
+      deploy_webui
       ;;
     u)
       clear
@@ -1908,6 +1823,11 @@ setup_dba_command
 check_system
 check_app
 
+if [[ $# -gt 0 ]]; then
+  if [[ $1 == mysql || $1 == pgsql ]]; then
+    check_cli_db $1
+  fi
+fi
 case "$1" in
   mysql)
     case "$2" in
@@ -1921,7 +1841,6 @@ case "$1" in
       fi
       ;;
     add)
-      check_mysql
       cli_mode=true
       dbname=$3
       dbuser=$4
@@ -1933,7 +1852,6 @@ case "$1" in
       exit 
       ;;
     del)
-      check_mysql
       dbname=$3
       cli_mode=true
       skip=$4
@@ -1942,13 +1860,11 @@ case "$1" in
       exit
       ;;
     "export")
-      check_mysql
       dbname=$3
       export_database "$dbname"
       exit
       ;;
     "import")
-      check_mysql
       cli_mode=true
       path=$3
       dbname=$4
@@ -1958,7 +1874,6 @@ case "$1" in
       exit
       ;;
     *)
-      check_mysql
       db_mode=mysql
       show_menu
       ;;
@@ -1976,7 +1891,6 @@ case "$1" in
       fi
       ;;
     add)
-      check_pgsql
       cli_mode=true
       dbname=$3
       dbuser=$4
@@ -1988,7 +1902,6 @@ case "$1" in
       exit 
       ;;
     del)
-      check_pgsql
       dbname=$3
       cli_mode=true
       skip=$4
@@ -1997,13 +1910,11 @@ case "$1" in
       exit
       ;;
     "export")
-      check_pgsql
       dbname=$3
       export_database "$dbname"
       exit
       ;;
     "import")
-      check_pgsql
       path=$3
       dbname=$4
       dbuser=$5
@@ -2012,7 +1923,6 @@ case "$1" in
       exit
       ;;
     *)
-      check_pgsql
       db_mode=pgsql
       show_menu
       ;;
@@ -2022,5 +1932,4 @@ case "$1" in
     exit 0
     ;;
 esac
-
 check_db
