@@ -8,7 +8,7 @@ CYAN='\033[0;36m'    # 一般提示用青色
 GRAY='\033[0;90m'
 RESET='\033[0m'      # 清除顏色
 
-version="4.3.0"
+version="5.0.0"
 cli_mode=false
 
 # 變亮
@@ -20,30 +20,24 @@ TOTAL_PAGES_PG=1
 
 # 檢查是否以root權限運行
 if [ "$(id -u)" -ne 0 ]; then
-  echo "此腳本需要root權限運行" 
   if command -v sudo >/dev/null 2>&1; then
-    exec sudo "$0" "$@"
-  else
-    install_sudo_cmd=""
-    if command -v apt >/dev/null 2>&1; then
-      install_sudo_cmd="apt-get update && apt-get install -y sudo"
-    elif command -v dnf >/dev/null 2>&1; then
-      install_sudo_cmd="dnf install -y sudo"
-    elif command -v apk >/dev/null 2>&1; then
-      install_sudo_cmd="apk add sudo"
-    else
-      echo "無sudo指令"
-      sleep 1
-      exit 1
-    fi
-    su -c "$install_sudo_cmd"
-    if [ $? -eq 0 ] && command -v sudo >/dev/null 2>&1; then
-      echo "sudo指令已經安裝成功，請等下輸入您的密碼"
+    if sudo -n true 2>/dev/null; then
+      echo "使用免密 sudo"
       exec sudo "$0" "$@"
+    elif sudo -l >/dev/null 2>&1; then
+      echo "使用 sudo（請輸入密碼）"
+      exec sudo "$0" "$@"
+    else
+      echo "sudo 存在但無權限"
     fi
   fi
+  if command -v su >/dev/null 2>&1; then
+    echo "使用 su（請輸入 root 密碼）"
+    exec su -c "$0 $*"
+  fi
+  echo "無法取得 root 權限"
+  exit 1
 fi
-
 # 檢查系統版本
 check_system(){
   if command -v apt >/dev/null 2>&1; then
@@ -56,47 +50,124 @@ check_system(){
     if command -v getenforce >/dev/null 2>&1; then
       if [ "$(getenforce)" == "Enforcing" ]; then
         selinux_enforcing=true
+      else
+        selinux_enforcing=false
       fi
     fi
     system=2
   elif command -v apk >/dev/null 2>&1; then
     system=3
   else
-    echo -e "${RED}不支援的系統。${RESET}"
-    exit 1
+    system=0
   fi
 }
 
 check_cli_db(){
+  is_host_process() {
+    local pid="$1"
+    local cgroup_file="/proc/$pid/cgroup"
+    local cgroup
+
+    [[ -r "$cgroup_file" ]] || return 1
+    cgroup=$(<"$cgroup_file")
+
+    # 有這些字樣，通常就是容器內進程
+    [[ "$cgroup" == *docker* || "$cgroup" == *containerd* || "$cgroup" == *kubepods* || "$cgroup" == *libpod* || "$cgroup" == *lxc* ]] && return 1
+
+    return 0
+  }
   local input=$1
   declare -A db=(
     ["mysql"]="MariaDB/MySQL"
     ["pgsql"]="PostgreSQL"
   )
 
+  detect_docker_db
+  total_in_all=$(( ${#docker_names_mariadb[@]} + ${#docker_names_mysql[@]}  + ${#docker_names_pgsql[@]}))
+
   case $input in
   mysql)
-    if command -v mysql >/dev/null 2>&1 || command -v mariadb >/dev/null 2>&1; then
+    # 🔥 先看 Docker（只允許唯一）
+    local total=$(( ${#docker_names_mariadb[@]} + ${#docker_names_mysql[@]} ))
+
+    if [[ $total -eq 1 ]]; then
+      if [[ ${#docker_names_mariadb[@]} -eq 1 ]]; then
+        docker_name="${docker_names_mariadb[0]}"
+      else
+        docker_name="${docker_names_mysql[0]}"
+      fi
+      db_mode="mysql"
       get_mysql_command
-      db_mode=mysql
+      unset is_host_process
+      return 
+    fi
+
+    # 🔥 fallback 本機（MySQL / MariaDB）
+    local found=false
+    for commfile in /proc/[0-9]*/comm; do
+      comm=$(<"$commfile")
+      pid=${commfile#/proc/}
+      pid=${pid%%/*}
+
+      if [[ "$comm" == "mariadbd" || "$comm" == "mysqld" ]]; then
+        if is_host_process "$pid"; then
+          found=true
+          unset is_host_process
+          break
+        fi
+      fi
+    done
+
+    if [[ "$found" == true ]]; then
+      docker_name=""
+      db_mode="mysql"
+      get_mysql_command
       return 0
     fi
     ;;
+    
   pgsql)
-    if command -v psql >/dev/null 2>&1; then
-      db_mode=pgsql
+    # 🔥 Docker
+    if [[ ${#docker_names_pgsql[@]} -eq 1 ]]; then
+      docker_name="${docker_names_pgsql[0]}"
+      db_mode="pgsql"
+      get_postgres_command
+      unset is_host_process
+      return 0
+    fi
+
+    # 🔥 fallback 本機（PostgreSQL）
+    local found=false
+    for commfile in /proc/[0-9]*/comm; do
+      comm=$(<"$commfile")
+      pid=${commfile#/proc/}
+      pid=${pid%%/*}
+
+      if [[ "$comm" == "postgres" || "$comm" == "postmaster" ]]; then
+        if is_host_process "$pid"; then
+          found=true
+          unset is_host_process
+          break
+        fi
+      fi
+    done
+    if [[ "$found" == true ]]; then
+      docker_name=""
+      db_mode="pgsql"
       get_postgres_command
       return 0
     fi
     ;;
   esac
-  echo -e "${YELLOW}未安裝${db[$input]}，請先安裝！${RESET}"
+
+  echo -e "${YELLOW}未安裝${db[$input]}，或存在多個 Docker 容器無法自動判定！${RESET}"
   exit 1
 }
 
 
 # 檢查無安裝內容
 check_app(){
+  [[ "$system" == "0" ]] && return 0
   local install_list=""
   
   if [ "$system" -eq 2 ] && [ ! -f /etc/fedora-release ]; then
@@ -105,7 +176,7 @@ check_app(){
     fi
   fi
 
-  for cmd in wget jq sudo; do
+  for cmd in wget jq sudo openssl; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
       install_list+=" $cmd"
     fi
@@ -130,31 +201,78 @@ check_app(){
 }
 
 check_db() {
+  is_host_process() {
+    local pid="$1"
+    local cgroup_file="/proc/$pid/cgroup"
+    local cgroup
+
+    [[ -r "$cgroup_file" ]] || return 1
+    cgroup=$(<"$cgroup_file")
+
+    # 有這些字樣，通常就是容器內進程
+    [[ "$cgroup" == *docker* || "$cgroup" == *containerd* || "$cgroup" == *kubepods* || "$cgroup" == *libpod* || "$cgroup" == *lxc* ]] && return 1
+
+    return 0
+  }
   count=0
-  pg=false
-  mysql=false
+  local_mysql=false
+  local_pg=false
 
-  if command -v psql >/dev/null 2>&1; then
-    pg=true
-    ((count++))
-  fi
+  detect_docker_db
+  total_in_all=$(( ${#docker_names_mariadb[@]} + ${#docker_names_mysql[@]}  + ${#docker_names_pgsql[@]}))
+  shopt -s nullglob
+  for commfile in /proc/[0-9]*/comm; do
+    local comm pid
+    comm=$(<"$commfile")
+    pid=${commfile#/proc/}
+    pid=${pid%%/*}
 
-  if command -v mysql >/dev/null 2>&1 || command -v mariadb >/dev/null 2>&1; then
-    mysql=true
-    ((count++))
-  fi
+    case "$comm" in
+      mariadbd|mysqld)
+        if is_host_process "$pid"; then
+          local_mysql=true
+           ((count++))  
+            ((total_in_all++))
+        fi
+        ;;
+      postgres|postmaster)
+        if is_host_process "$pid"; then
+          local_pg=true
+          ((count++))  
+          ((total_in_all++))
+        fi
+        ;;
+    esac
 
+    [[ "$local_mysql" == true && "$local_pg" == true ]] && break
+  done
+  shopt -u nullglob
+  unset is_host_process
   case $count in
     0)
       install_menu
       ;;
     1)
-      if [[ $pg = true ]]; then
-        get_postgres_command
+      if [[ ${#docker_names_pgsql[@]} -eq 1 ]]; then
+        docker_name="${docker_names_pgsql[0]}"
         db_mode=pgsql
-      else
-        get_mysql_command
+        get_postgres_command
+      elif [[ ${#docker_names_mariadb[@]} -eq 1 ]]; then
+        docker_name="${docker_names_mariadb[0]}"
         db_mode=mysql
+        get_mysql_command
+      elif [[ ${#docker_names_mysql[@]} -eq 1 ]]; then
+        docker_name="${docker_names_mysql[0]}"
+        db_mode=mysql
+        get_mysql_command
+      elif [[ $local_pg == true ]]; then
+        docker_name=""
+        db_mode=pgsql
+        get_postgres_command
+      else
+        docker_name=""
+        db_mode=mysql
+        get_mysql_command
       fi
       show_menu
       ;;
@@ -163,6 +281,33 @@ check_db() {
       ;;
   esac
 }
+detect_docker_db() {
+  docker_names_mysql=()
+  docker_names_mariadb=()
+  docker_names_pgsql=()
+
+  local container_list
+  container_list=$(curl -s --unix-socket /var/run/docker.sock http://localhost/containers/json \
+    | jq -r '.[] | "\(.Names[0])|\(.Image)"' | sed 's#^/##')
+
+  while IFS="|" read -r c_name c_image; do
+    if [[ "$c_image" =~ mariadb ]]; then
+      docker_names_mariadb+=("$c_name")
+      ((count++))
+    elif [[ "$c_image" =~ mysql ]]; then
+      docker_names_mysql+=("$c_name")
+      ((count++))  
+    elif [[ "$c_image" =~ postgres ]]; then
+      docker_names_pgsql+=("$c_name")
+      ((count++))
+    fi
+  done <<< "$container_list"
+
+  # docker 只要有就標記
+  [[ ${#docker_names_mysql[@]} -gt 0 || ${#docker_names_mariadb[@]} -gt 0 ]] && mysql=true
+  [[ ${#docker_names_pgsql[@]} -gt 0 ]] && pg=true
+}
+
 deploy_webui() {
   setup_reverse_proxy() {
     local port="$1"
@@ -181,117 +326,241 @@ deploy_webui() {
       fi
     fi
   }
-  local db_host="172.17.0.1"
   local mysql_port=3306
   local pgsql_port=5432
   local ui_user="admin"
   local ui_pass="$(openssl rand -base64 12 | tr -dc A-Za-z0-9)"
   local port=""
-  local confirm
+  local confirm=""
+  local domain=""
+  local extra_env=""
 
-  # 檢查 docker
+  # 檢查 Docker 是否安裝
   if ! command -v docker &>/dev/null; then
     echo -e "${RED}Docker 未安裝，請先安裝 Docker。${RESET}"
     return 1
   fi
 
-  # 隨機端口
+  # --- 環境自動適應判定 ---
+  local final_db_host=""
+  local net_cfg=""
+
+  if [[ -n "$docker_name" ]]; then
+    # 情況 A：資料庫在容器內 -> 使用容器名稱，並加入同一個 Docker 網路
+    final_db_host=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$docker_name")
+    
+    # 自動偵測目標容器所屬的網路 (取第一個，避免多網路噴錯)
+    local db_net
+    db_net=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$docker_name" | awk '{print $1}')
+    net_cfg="--network ${db_net:-bridge}"
+  else
+    # 情況 B：資料庫在本機 -> 抓取 Docker Bridge 的 Gateway IP
+    final_db_host=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo "172.17.0.1")
+    net_cfg="" 
+  fi
+  # -----------------------
+
+  # 隨機或手動指定映射端口
   while true; do
     read -r -p "請輸入數據庫管理映射端口（留空自動隨機）:" port
     if [[ -z "$port" ]]; then
       port=$(( ( RANDOM % (65535 - 1025) ) + 1025 ))
       echo -e "${CYAN}自動選擇隨機端口：$port${RESET}"
     fi
+    # 檢查端口是否被佔用
     ss -tuln | awk '{print $5}' | grep -qE ":$port$" \
       && echo -e "${YELLOW}端口 $port 已被佔用，請重新輸入！${RESET}" \
       || break
   done
+
+  # 根據資料庫類型部署對應的 WebUI
   if [[ "$db_mode" = "mysql" ]]; then
     if ! docker ps -a --format '{{.Names}}' | grep -q "^phpmyadmin$"; then
       
-      local extra_env=""
-
       read -p "是否使用反向代理[Y/n](Default:N) " confirm
       confirm=${confirm,,}
 
       if [[ "$confirm" == "y" ]]; then
-        if setup_reverse_proxy $port; then
+        # 呼叫外部的 setup_reverse_proxy
+        if setup_reverse_proxy "$port"; then
+          # 假設 setup_reverse_proxy 會設定好 global 變數 domain
           extra_env="-e PMA_ABSOLUTE_URI=https://$domain"
         else
           domain=""
         fi
       fi
 
-      docker run -d --restart always --name phpmyadmin -p "$port":80 -e PMA_HOST="$db_host" -e PMA_PORT="$mysql_port" $extra_env phpmyadmin/phpmyadmin
+      # 執行 phpMyAdmin
+      # 注意：$net_cfg 和 $extra_env 不要加雙引號，讓 Bash 自動展開或忽略空值
+      docker run -d --restart always --name phpmyadmin \
+        $net_cfg \
+        -p "$port":80 \
+        -e PMA_HOST="$final_db_host" \
+        -e PMA_PORT="$mysql_port" \
+        $extra_env \
+        phpmyadmin/phpmyadmin
 
       if [[ -n "$domain" ]]; then
         echo -e "${GREEN}phpMyAdmin 已創建於 https://$domain${RESET}"
       else
         echo -e "${GREEN}phpMyAdmin 已啟動於 http://localhost:$port${RESET}"
       fi
-      sleep 5
+      sleep 3
+    else
+      echo -e "${YELLOW}phpMyAdmin 容器已存在！${RESET}"
     fi
-  elif [[ "$db_mode" = "pgsql" ]]; then
 
+  elif [[ "$db_mode" = "pgsql" ]]; then
     if ! docker ps -a --format '{{.Names}}' | grep -q "^adminer$"; then
-      docker run -d \
-        --restart always \
-        --name adminer \
-        -p $port:8080 \
+      
+      read -p "是否使用反向代理[Y/n](Default:N) " confirm
+      confirm=${confirm,,}
+
+      if [[ "$confirm" == "y" ]]; then
+        if ! setup_reverse_proxy "$port"; then
+          domain=""
+        fi
+      fi
+
+      # 執行 Adminer
+      docker run -d --restart always --name adminer \
+        $net_cfg \
+        -p "$port":8080 \
+        -e ADMINER_DEFAULT_SERVER="$final_db_host" \
         adminer
 
-      setup_reverse_proxy "$port"
-
       if [[ -n "$domain" ]]; then
-        echo -e "${GREEN}Adminer 已啟動於 http://$domain${RESET}"
+        echo -e "${GREEN}Adminer 已啟動於 https://$domain${RESET}"
       else
         echo -e "${GREEN}Adminer 已啟動於 http://localhost:$port${RESET}"
       fi
-      echo "主機名稱: $db_host"
+      
+      echo -e "${CYAN}主機名稱 (登入時填寫): $final_db_host${RESET}"
       read -p "操作完成，請按任意鍵繼續..." -n1
+    else
+      echo -e "${YELLOW}Adminer 容器已存在！${RESET}"
     fi
   fi
+
+  # 清理環境變數
   unset domain
-  unset setup_reverse_proxy
 }
 
 
 
 # 全域變數 MYSQL_CMD（陣列）將會被設定為 mysql 指令
 MYSQL_CMD=()
-
 get_mysql_command() {
   if [ ${#MYSQL_CMD[@]} -gt 0 ]; then
     return 0
   fi
+  [[ -n "$password" ]] && return 0
+  local decrypt_tool="/etc/database"
   local mysql_root_pw=""
-  local pass_file="/etc/mysql-pass.conf"
+  local pass_file="/etc/mysql_pss.conf"
+  # --- Docker 版本處理邏輯 ---
+  if [[ -n "$docker_name" ]]; then
+  
+    if docker exec "$docker_name" sh -c 'command -v mariadb >/dev/null 2>&1'; then
+      docker_name_mydb_type=mariadb
+      docker_name_mydb_dump_type=mariadb-dump
+    elif docker exec "$docker_name" sh -c 'command -v mysql >/dev/null 2>&1'; then
+      docker_name_mydb_type=mysql
+      docker_name_mydb_dump_type=mysqldump
+    else
+      echo -e "${RED}容器內找不到可用的執行命令。${RESET}"
+    fi
+  
+    if docker exec "$docker_name" "$docker_name_mydb_type" -u root -e "SELECT 1;" &>/dev/null; then
+      MYSQL_CMD=("docker" "exec" "-i" "$docker_name" "$docker_name_mydb_type" "-u" "root")
+      MYSQL_DUMP_CMD=("docker" "exec" "-i" "$docker_name" "$docker_name_mydb_dump_type" "-u" "root")
+      return 0
+    fi
+
+    if [ ! -f "$decrypt_tool" ]; then
+      wget -qO $decrypt_tool https://files.gebu8f.com/files/dbcrypt
+      chmod +x $decrypt_tool
+    fi
+
+    # 1. 透過 dbcrypt 解密獲取密碼
+    if [ -f "$pass_file" ]; then
+      mysql_root_pw=$($decrypt_tool decryption /etc/mysql_pss.conf)
+    fi
+    if [ -z "$mysql_root_pw" ]; then
+      while true; do
+        read -s -p "請輸入 MySQL root 密碼：" mysql_root_pw
+        echo
+        attempt=$((attempt + 1))
+
+        if [ -z "$mysql_root_pw" ]; then
+          echo -e "${YELLOW}密碼不能為空，請再試一次。${RESET}"
+          continue
+        fi
+        if docker exec $docker_name $type -u root -p"$mysql_root_pw" -e "SELECT 1;" &>/dev/null; then
+          $decrypt_tool encryption $mysql_root_pw $pass_file >/dev/null 2>&1
+          echo -e "${GREEN}已將 root 密碼加密${RESET}"
+          return 0
+        else
+          echo -e "${RED}密碼錯誤，請再試一次。${RESET}"
+        fi
+        if [ $attempt -ge $max_attempts ]; then
+          echo -e "${RED}已達最大嘗試次數 ($max_attempts)，程式退出。${RESET}"
+          exit 1
+        fi
+      done
+    fi
+    MYSQL_DUMP_CMD=("docker" "exec" "-i" "-e" "MYSQL_PWD=$mysql_root_pw" "$docker_name" "$docker_name_mydb_dump_type" "-u" "root")
+    MYSQL_CMD=("docker" "exec" "-i" "-e" "MYSQL_PWD=$mysql_root_pw" "$docker_name" "$docker_name_mydb_type" "-u" "root")
+    return 0
+  fi
+  local old_pass_file="/etc/mysql-pass.conf"
   local cmd=""
   local attempt=0
   local max_attempts=5
 
-  # 優先使用 mariadb 指令
   if command -v mariadb >/dev/null 2>&1; then
     cmd="mariadb"
+    dump_cmd="mariadb-dump"
   elif command -v mysql >/dev/null 2>&1; then
     cmd="mysql"
+    dump_cmd="mysqldump"
+  else
+    echo -e "${RED}找不到 mysql 或 mariadb 指令。${RESET}"
+    exit 1
   fi
 
   # 嘗試無密碼登入
   if $cmd -u root -e "SELECT 1;" &>/dev/null; then
     MYSQL_CMD=("$cmd" "-u" "root")
+    MYSQL_DUMP_CMD=("$dump_cmd" "-u" "root")
     return 0
   fi
-
-  # 嘗試讀取 /etc/mysql-pass.conf
-  if [ -f "$pass_file" ]; then
-    mysql_root_pw=$(< "$pass_file")
-    if $cmd -u root -p"$mysql_root_pw" -e "SELECT 1;" &>/dev/null; then
-      MYSQL_CMD=("$cmd" "-u" "root" "-p$mysql_root_pw")
-      return 0
+  # --- 1. 優先嘗試新版加密文件 ---
+  if [ -f "$pass_file" ] && [ -f "$decrypt_tool" ]; then
+    mysql_root_pw=$("$decrypt_tool" decryption "$new_pass_file" 2>/dev/null)
+    
+    if [ ! -z "$mysql_root_pw" ]; then
+      if $cmd -u root -p"$mysql_root_pw" -e "SELECT 1;" &>/dev/null; then
+        MYSQL_CMD=("$cmd" "-u" "root" "-p$mysql_root_pw")
+        MYSQL_DUMP_CMD=("$dump_cmd" "-u" "root" "-p$mysql_root_pw")
+        return 0
+      fi
     fi
   fi
 
+  # --- 2. 次要嘗試舊版明文文件 (相容老系統) ---
+  if [ -f "$old_pass_file" ]; then
+    mysql_root_pw=$(< "$old_pass_file")
+    if [ ! -z "$mysql_root_pw" ]; then
+      if $cmd -u root -p"$mysql_root_pw" -e "SELECT 1;" &>/dev/null; then
+        $decrypt_tool encryption $mysql_root_pw $pass_file >/dev/null 2>&1
+        rm -f $old_pass_file
+        MYSQL_CMD=("$cmd" "-u" "root" "-p$mysql_root_pw")
+        MYSQL_DUMP_CMD=("$dump_cmd" "-u" "root" "-p$mysql_root_pw")
+        return 0
+      fi
+    fi
+  fi
   # 不存在 conf 或無效，請使用者輸入
   while true; do
     read -s -p "請輸入 MySQL root 密碼：" mysql_root_pw
@@ -303,11 +572,11 @@ get_mysql_command() {
       continue
     fi
 
-    if $cmd -u root -p"$mysql_root_pw" -e "SELECT 1;" &>/dev/null; then
-      echo "$mysql_root_pw" > "$pass_file"
-      chmod 600 "$pass_file"
-      echo -e "${GREEN}已將 root 密碼寫入 $pass_file (權限 600)${RESET}"
+    if $cmd -u root "-p'$mysql_root_pw'" -e "SELECT 1;" &>/dev/null; then
+      $decrypt_tool encryption "$mysql_root_pw" $pass_file >/dev/null 2>&1
+      echo -e "${GREEN}已將 root 密碼加密${RESET}"
       MYSQL_CMD=("$cmd" "-u" "root" "-p$mysql_root_pw")
+      MYSQL_DUMP_CMD=("$dump_cmd" "-u" "root" "-p$mysql_root_pw")
       return 0
     else
       echo -e "${RED}密碼錯誤，請再試一次。${RESET}"
@@ -320,30 +589,42 @@ get_mysql_command() {
   done
 }
 
+
 PSQL_CMD=()
 PGDUMP_CMD=()
 
 get_postgres_command() {
-  # --- 前置檢查 (保持不變) ---
-  if ! id "postgres" &>/dev/null; then
-    echo -e "${RED}找不到 postgres 系統使用者，請確認 PostgreSQL 是否已正確安裝並初始化。${RESET}" >&2
-    exit 1
-  fi
-  pg_major=$(psql -V | grep -oP 'PostgreSQL\)\s+\K[0-9]+' )
-  _filtered_sudo() {
-    sudo "$@" 2> >(grep -v "unable to resolve host" >&2)
-  }
-  export -f _filtered_sudo
+  # 如果 $docker_name 是 pgsql，走 Docker 路徑
+  if [ -n "$docker_name" ]; then
+    # Docker 模式：直接定義命令，不需檢測實體機使用者
+    # -i: 交互模式, -u postgres: 以容器內的 postgres 用戶執行
+    PSQL_CMD=("docker" "exec" "-i" "-u" "postgres" "$docker_name" "psql" "-q" "-t" "-A")
+    PSQL_EXEC_CMD=("docker" "exec" "-i" "-u" "$docker_name" "postgres" "psql" "-c")
+    PGDUMP_CMD=("docker" "exec" "-i" "-u" "postgres" "$docker_name" "pg_dump")
+    return 0
+  else
+    if ! id "postgres" &>/dev/null; then
+      echo -e "${RED}找不到 postgres 系統使用者，請確認 PostgreSQL 是否已正確安裝並初始化。${RESET}" >&2
+      exit 1
+    fi
 
-  PSQL_CMD=("_filtered_sudo" "-iu" "postgres" "psql" "-q" "-t" "-A")
-  PSQL_EXEC_CMD=("_filtered_sudo" "-iu" "postgres" "psql" "-c")
-  PGDUMP_CMD=("_filtered_sudo" "-iu" "postgres" "pg_dump")
-  return 0
+    _filtered_sudo() {
+      sudo "$@" 2> >(grep -v "unable to resolve host" >&2)
+    }
+    export -f _filtered_sudo
+
+    PSQL_CMD=("_filtered_sudo" "-iu" "postgres" "psql" "-q" "-t" "-A")
+    PSQL_EXEC_CMD=("_filtered_sudo" "-iu" "postgres" "psql" "-c")
+    PGDUMP_CMD=("_filtered_sudo" "-iu" "postgres" "pg_dump")
+  
+    return 0
+  fi
 }
 
+
 postgres_external_access() {
+  [ -n $docker_name ] && return 0
   local username=$1
-  
   local conf_file=$(_filtered_sudo -iu postgres psql -tAc "SHOW config_file;")
   local hba_file=$(_filtered_sudo -iu postgres psql -tAc "SHOW hba_file;")
   if ! grep -P "^\s*listen_addresses\s*=\s*'\*'" "$conf_file" >/dev/null; then
@@ -357,7 +638,6 @@ postgres_external_access() {
   if ! grep -E "host\s+all\s+$username\s+0\.0\.0\.0/0\s+md5" "$hba_file" >/dev/null; then
     echo "host all $username 0.0.0.0/0 md5" >> "$hba_file"
   fi
-  access_mode=外網
 }
 
 postgres_revoke_external_access() {
@@ -396,15 +676,14 @@ create_database() {
   local username="${2:-}"
   local password="${3:-}"
   local allow_remote="$4"
-  local dbname=""
-  local host="localhost"
-  local add_user=""
+  local dbname host add_user
+  local host_dec="localhost"
 
   # 要求輸入資料庫名稱
   if [ -z "$raw_dbname" ]; then
     read -p "請輸入資料庫名稱：" raw_dbname
   fi
-  dbname=$(sanitize_name "$raw_dbname")
+  dbname=$(echo "$raw_dbname" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_]//g')
 
   # CLI 模式下預設創建用戶
   if [ "$cli_mode" = "false" ]; then
@@ -421,21 +700,27 @@ create_database() {
   fi
 
   # 外網設定
-  if [ "$db_mode" == "mysql" ]; then
-    if [ -z "$allow_remote" ]; then
-      read -p "此用戶是否需要外網訪問？(y/n)：" allow_remote
-    fi
-    [[ "$allow_remote" =~ ^[Yy]$ ]] && host="%" || host="localhost"
-  elif [ "$db_mode" == "pgsql" ]; then
-    if [ -z "$allow_remote" ]; then
-      read -p "此用戶是否需要外網訪問？(y/n)：" allow_remote
-    fi
-    allow_remote=${allow_remote,,}
-    if [[ "$allow_remote" == "y" ]]; then
-      postgres_external_access "$username"
-      host="外網"
-    fi
+  [[ -n "$docker_name" ]] && allow_remote=y
+  if [ -z "$allow_remote" ]; then
+    read -p "此用戶是否需要全域訪問？(y/n)：" allow_remote
   fi
+  case $db_mode in
+  mysql)
+    if [[ "$allow_remote" =~ ^[Yy]$ ]]; then
+      host="%"
+      host_dec="0.0.0.0"
+    else
+      host="localhost"
+      host_dec="$host"
+    fi
+    ;;
+  pgsql)
+    if [[ "$allow_remote" =~ ^[Yy]$ ]]; then
+      postgres_external_access "$username"
+      host_dec="0.0.0.0"
+    fi
+    ;;
+  esac
 
   # 密碼設定
   if [[ "$add_user" == "y" ]]; then
@@ -476,11 +761,8 @@ create_database() {
       "${PSQL_EXEC_CMD[@]}" "REVOKE ALL ON SCHEMA public FROM PUBLIC;" >/dev/null
       "${PSQL_EXEC_CMD[@]}" "GRANT ALL ON SCHEMA public TO \"$username\";" >/dev/null
     fi
-    if [ $allow_remote == y ]; then
-      (service postgresql restart 2>/dev/null || service postgresql-$pg_major restart 2>/dev/null)
-    fi
   fi
-  
+
   # CLI模式不顯示
   if [ "$cli_mode" == "true" ]; then return 0; fi
 
@@ -489,7 +771,7 @@ create_database() {
   if [[ "$add_user" == "y" ]]; then
     echo "用戶名稱：$username"
     echo "用戶密碼：$password"
-    echo "主機地址：$host"
+    echo "主機地址：$host_dec"
   fi
 }
 
@@ -1156,10 +1438,23 @@ grant_user() {
 
 export_database() {
   local dbname="${1:-}"
+  local backup_dir
   # --- 決定備份目錄 ---
   case $db_mode in
-    mysql) local backup_dir="${2:-/root/mysql_backups}" ;;
-    pgsql) local backup_dir="${2:-/root/postgres_backups}" ;;
+    mysql)
+      if [[ -n "$docker_name" ]]; then
+        backup_dir="/opt/out_database/mysql"
+      else
+        backup_dir="${2:-/opt/out_database/mysql}"
+      fi
+      ;;
+    pgsql)
+      if [[ -n "$docker_name" ]]; then
+        backup_dir="/opt/out_database/pgsql"
+      else
+        backup_dir="${2:-/opt/out_database/pgsql}"
+      fi
+      ;;
   esac
 
   mkdir -p "$backup_dir"
@@ -1223,27 +1518,7 @@ export_database() {
       echo -e "${RED}資料庫 $dbname 不存在！${RESET}" >&2
       return 1
     fi
-
-    # --- 自動偵測可用 dump 工具 ---
-    local DUMP_BIN=""
-    for cmd in mariadb-dump mysqldump; do
-      if command -v "$cmd" >/dev/null 2>&1; then
-        DUMP_BIN="$cmd"
-        break
-      fi
-    done
-
-    if [ -z "$DUMP_BIN" ]; then
-      echo -e "${RED}找不到可用的 MySQL/MariaDB 匯出工具（mysqldump / mariadb-dump）。${RESET}" >&2
-      sleep 1
-      return 1
-    fi
-    # 取代 MYSQL_CMD 中的 mysql → 將帳密參數複製到 dump
-    local DUMP_CMD=("$DUMP_BIN")
-    for arg in "${MYSQL_CMD[@]:1}"; do
-      DUMP_CMD+=("$arg")
-    done
-
+    DUMP_CMD=("${MYSQL_DUMP_CMD[@]}")
     if "${DUMP_CMD[@]}" "$dbname" > "$backup_file"; then
       echo -e "${GREEN}資料庫 '$dbname' 已成功匯出至：${RESET}" >&2
       echo "$backup_file"
@@ -1288,8 +1563,20 @@ import_database() {
   else
     # 互動模式: 引導使用者選擇
     case $db_mode in
-      mysql) backup_dir="/root/mysql_backups" ;;
-      pgsql) backup_dir="/root/postgres_backups" ;;
+    mysql)
+      if [[ -n "$docker_name" ]]; then
+        backup_dir="/opt/out_database/mysql"
+      else
+        backup_dir="${2:-/root/mysql_backups}"
+      fi
+      ;;
+    pgsql)
+      if [[ -n "$docker_name" ]]; then
+        backup_dir="/opt/out_database/pgsql"
+      else
+        backup_dir="${2:-/root/postgres_backups}"
+      fi
+      ;;
     esac
 
     if [ ! -d "$backup_dir" ] || ! ls "$backup_dir"/*.sql >/dev/null 2>&1; then
@@ -1383,28 +1670,86 @@ import_database() {
 # 解除安裝資料庫
 uninstall_database(){
   local type=$1
-  read -p "警告：這將會移除此資料庫及其所有資料，確定要繼續嗎？ (y/n) " confirm
-  if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-    echo -e "${CYAN}操作已取消。${RESET}"
-    return
+  read -p "警告：這將會移除此資料庫及其所有資料，是否保留資料？ (y/n)[Default:Y] " confirm
+  confirm=${confirm,,}
+  confirm=${confirm:-y}
+  if [[ -n "$docker_name" ]]; then
+  case $type in
+    mysql)
+      local img_id
+      local docker_data_paths=()
+
+      img_id=$(docker inspect -f '{{.Image}}' "$docker_name" 2>/dev/null)
+
+      # 讀出所有 bind mount 的 host 路徑
+      mapfile -t docker_data_paths < <(
+        docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{println .Source}}{{end}}{{end}}' "$docker_name" 2>/dev/null
+      )
+
+      docker stop "$docker_name" 2>/dev/null
+      docker rm "$docker_name" 2>/dev/null
+
+      if [[ -n "$img_id" ]]; then
+        echo -e "${YELLOW}正在移除 MariaDB/MySQL 鏡像...${RESET}"
+        docker rmi "$img_id" || echo -e "${RED}鏡像正在被其他容器使用，跳過刪除。${RESET}"
+      fi
+      ;;
+
+    pgsql)
+      local img_id
+      local docker_data_paths=()
+
+      img_id=$(docker inspect -f '{{.Image}}' "$docker_name" 2>/dev/null)
+
+      mapfile -t docker_data_paths < <(
+        docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{println .Source}}{{end}}{{end}}' "$docker_name" 2>/dev/null
+      )
+
+      docker stop "$docker_name" 2>/dev/null
+      docker rm "$docker_name" 2>/dev/null
+
+      if [[ -n "$img_id" ]]; then
+        echo -e "${YELLOW}正在移除 PostgreSQL 鏡像...${RESET}"
+        docker rmi "$img_id" || echo -e "${RED}鏡像正在被其他容器使用，跳過刪除。${RESET}"
+      fi
+      ;;
+  esac
+
+  [[ $total_in_all -eq 1 ]] && rm -f /etc/databaserm /usr/local/bin/dba
+  rm -f /etc/"$type"-pss.conf
+
+  if [[ $confirm == n ]]; then
+    for dir in "${docker_data_paths[@]}"; do
+      [[ -n "$dir" ]] && rm -rf -- "$dir"
+    done
+    rm -rf /opt/"$type"_data /opt/out_database/"$type"
+    echo -e "${GREEN}所有資料已清除完畢。${RESET}"
+    exit 0
   fi
+
+  echo -e "${GREEN}已清除容器本身，保留資料。${RESET}"
+  exit 0
+fi
   case $type in
   mysql)
     if [ $system -eq 1 ]; then
-      apt-get purge -y mariadb-server mariadb-common
-      apt-get autoremove -y
+      apt purge -y mariadb-server mariadb-common
+      apt autoremove -y
     elif [ $system -eq 2 ]; then
-      dnf remove -y mariadb-server
+      dnf remove -y MariaDB 
       dnf autoremove -y
     elif [ $system -eq 3 ]; then
       apk del mariadb
     fi
-    rm -rf /etc/mysql /var/lib/mysql /etc/mysql-pass.conf /root/mysql_backups
-    echo -e "${GREEN}MySQL已成功解除安裝並清除所有相關文件。${RESET}"
-    exit 0
+    if [ $confirm == n ]; then
+      rm -rf /etc/mysql /var/lib/mysql
+      echo -e "${GREEN}MySQL已成功解除安裝並清除所有相關文件。${RESET}"
+    else
+      echo -e "${GREEN}MySQL已成功解除安裝並保留所有相關文件。${RESET}"
+    fi
     ;;
   pgsql)
-    (service postgresql stop 2>/dev/null || service postgresql-17 stop 2>/dev/null)
+    (service postgresql stop 2>/dev/null || service postgresql-* stop 2>/dev/null)
     if [ $system -eq 1 ]; then
       apt-get purge -y 'postgresql-*'
       apt-get autoremove -y
@@ -1414,14 +1759,19 @@ uninstall_database(){
     elif [ $system -eq 3 ]; then
       apk del $(apk info | grep '^postgresql')
     fi
-
-    # 删除 PostgreSQL 配置文件和数据目录
-    rm -rf /etc/postgresql /var/lib/postgresql /root/postgres_backups
-
-    echo -e "${GREEN}PostgreSQL 已成功解除安裝並清除所有相關文件。${RESET}"
-    exit 0
+    
+    if [ $confirm == n ]; then
+      rm -rf /etc/postgresql /var/lib/postgresql /var/lib/pgsql/
+      echo -e "${GREEN}PostgreSQL 已成功解除安裝並清除所有相關文件。${RESET}"
+    else
+      echo -e "${GREEN}PostgreSQL 已成功解除安裝並保留所有相關文件。${RESET}"
+    fi
     ;;
   esac
+  rm -rf /opt/"$type"_data /opt/out_database/"$type"
+  [[ $total_in_all -eq 1 ]] && rm -f /etc/database /usr/local/bin/dba
+  rm -f /etc/"$type"-pss.conf
+  exit 0
 }
 
 install_database(){
@@ -1434,6 +1784,7 @@ install_database(){
   local lts_versions=""
   case $type in
   mysql)
+    [ -d "/opt/out_database/mysql" ] && mkdir -p /opt/out_database/mysql
     if command -v mysql >/dev/null 2>&1 || command -v mariadb >/dev/null 2>&1; then
       if [ "$cli_mode" == false ]; then
         exec dba mysql
@@ -1466,7 +1817,7 @@ install_database(){
       if [ "$system" -eq 1 ]; then
         apt install -y curl gnupg lsb-release jq
           curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup \
-          | bash -s -- --mariadb-server-version="$mysql_ver"
+          | bash -s -- --mariadb-server-version="$mysql_ver" --skip-maxscale
         apt update
         apt install -y mariadb-server
         systemctl enable mariadb
@@ -1474,7 +1825,7 @@ install_database(){
       elif [ "$system" -eq 2 ]; then
         dnf install -y curl jq
         curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup \
-        | bash -s -- --mariadb-server-version="$mysql_ver"
+        | bash -s -- --mariadb-server-version="$mysql_ver" --skip-maxscale
         dnf install -y MariaDB-server
         if $selinux_enforcing; then
           [ ! -d /var/log/mariadb ] && mkdir -p /var/log/mariadb && chown mysql:mysql /var/log/mariadb
@@ -1495,17 +1846,27 @@ install_database(){
         fi
         systemctl enable mariadb
         systemctl start mariadb
-
       elif [ "$system" -eq 3 ]; then
         apk add mariadb mariadb-client mariadb-openrc
         rc-update add mariadb default
         mysql_install_db --user=mysql --basedir=/usr --datadir=/var/lib/mysql
         service mariadb start
+      else
+        if command -v docker >/dev/null 2>&1; then
+          docker_install_database mysql
+        fi
       fi
+      echo -ne "${YELLOW}等待 MariaDB/MySQL 就緒...${RESET}"
+      until mariadb-admin ping >/dev/null 2>&1; do
+        sleep 1
+      done
+      sleep 5
+      echo -e "${GREEN}MySQL安裝完成！${RESET}"
       [ "$cli_mode" == false ] && exec dba mysql
     fi
     ;;
   pgsql)
+    [ -d "/opt/out_database/pgsql" ] && mkdir -p /opt/out_database/pgsql
     if command -v psql >/dev/null 2>&1; then
       if [ "$cli_mode" == false ]; then
         exec dba pgsql
@@ -1544,7 +1905,22 @@ install_database(){
 
       elif [ "$system" -eq 2 ]; then
         major_ver=$(rpm -E %{rhel})
-        dnf install -y "https://download.postgresql.org/pub/repos/dnf/reporpms/EL-${major_ver}-x86_64/pgdg-redhat-repo-latest.noarch.rpm"
+        REPO_PAGE="https://download.postgresql.org/pub/repos/yum/reporpms/EL-${major_ver}-x86_64/"
+        RPM_FILE=$(curl -s "$REPO_PAGE" \
+          | grep -oE "pgdg-redhat-repo-latest\.noarch\.rpm" \
+          | head -n1)
+
+        if [[ -z "$RPM_FILE" ]]; then
+          RPM_FILE=$(curl -s "$REPO_PAGE" \
+            | grep -oE "pgdg-redhat-repo-EL-${major_ver}-[0-9.-]+\.noarch\.rpm" \
+            | sort -V \
+            | tail -n1)
+        fi
+        if [[ -z "$RPM_FILE" ]]; then
+          echo "找不到 PostgreSQL repo rpm（EL-${major_ver}）"
+          exit 1
+        fi
+        dnf install -y "${REPO_PAGE}${RPM_FILE}"
         dnf config-manager --disable pgdg*
         dnf config-manager --enable "pgdg$pg_ver"
         if [ "$major_ver" -ge 8 ]; then
@@ -1574,10 +1950,172 @@ install_database(){
         rc-update add postgresql default
         rc-service postgresql start
       fi
+      
+      echo -ne "${YELLOW}等待 PostgreSQL 就緒...${RESET}"
+      until pg_isready -U postgres >/dev/null 2>&1; do
+        sleep 1
+      done
+      sleep 5
 
       echo -e "${GREEN}PostgreSQL 已安裝完成。${RESET}" >&2
       [ "$cli_mode" == false ] && exec dba pgsql
     fi
+    ;;
+  esac
+}
+docker_install_database() {
+  if ! command -v docker >/dev/null 2>&1; then
+    echo -e "${RED}沒有Docker，無法進行安裝。${RESET}"
+    exit 1
+  fi
+  countdown_confirm() {
+    local seconds="$1"
+    local input
+    local interrupted=0
+
+    # 只在倒數階段攔截 Ctrl+C
+    trap 'interrupted=1' INT
+
+    while (( seconds > 0 )); do
+        printf "\r倒數 %2d 秒後自動執行，按 Enter 立即開始，Ctrl+C 返回選單 " "$seconds"
+
+        # 等待 1 秒，若使用者按 Enter，立刻開始
+        if read -r -t 1 input; then
+            printf "\n"
+            trap - INT
+            return 0
+        fi
+
+        # 如果是 Ctrl+C，回選單
+        if (( interrupted )); then
+            printf "\n[檢測到中斷] 返回選單中...\n"
+            trap - INT
+            return 1
+        fi
+
+        ((seconds--))
+    done
+
+    printf "\n[時間到] 自動繼續...\n"
+    trap - INT
+    return 0
+  }
+  local TIMEZONE=$(readlink /etc/localtime | sed 's|.*/zoneinfo/||')
+  [ -z "$TIMEZONE" ] && TIMEZONE="UTC"
+  mkdir -p /opt/out_database
+  case $1 in
+  mysql)
+    local AVAILABLE_RAM OPTION CALCULATED_RAM
+    while true; do
+      AVAILABLE_RAM=$(free -m | awk '/^Mem:/{print $7}')
+      clear
+      echo "=========================================="
+      echo "系統當前可用記憶體 (Available): ${AVAILABLE_RAM}MB"
+      echo "請選擇 MariaDB 記憶體分配等級:"
+      echo "1) 低 (20%)"
+      echo "2) 中 (57%) - 推薦"
+      echo "3) 高 (70%)"
+      echo "4) 自訂 (Mb)"
+      read -p "請輸入選項 [1-4, 預設 2]: " OPTION
+      OPTION=${OPTION:-2}
+      CALCULATED_RAM=""
+
+      case "$OPTION" in
+      1) PERCENT=20 ;;
+      2) PERCENT=57 ;;
+      3) PERCENT=70 ;;
+      4)
+        read -p "請輸入欲分配的 MB 數: " CALCULATED_RAM
+        if [[ ! "$CALCULATED_RAM" =~ ^[0-9]+$ ]] || (( CALCULATED_RAM <= 0 )); then
+          echo -e "${RED}輸入錯誤，請輸入正整數。${RESET}"
+          sleep 1
+          continue
+        fi
+        ;;
+      *)
+        echo -e "${RED}無效選項，重新選擇...${RESET}"
+        sleep 1
+        continue
+        ;;
+      esac
+
+      if [ -z "$CALCULATED_RAM" ]; then
+        CALCULATED_RAM="$((AVAILABLE_RAM * PERCENT / 100))M"
+      fi
+      echo -e "${GREEN}最終預計分配: $CALCULATED_RAM${RESET}"
+      if countdown_confirm 10; then
+        echo -e "${GREEN}[確認完成] 開始啟動 MariaDB 安裝程序...${RESET}"
+        break
+      else
+        continue
+      fi
+    done
+    mkdir -p /opt/mysql_init
+    echo "ALTER USER 'root'@'localhost' IDENTIFIED VIA unix_socket;" > /opt/mysql_init/01_set_unix_socket.sql
+
+    docker run -d \
+      -p 3306:3306 \
+      --name mariadb \
+      --restart always \
+      -e TZ="$TIMEZONE" \
+      -e MARIADB_ALLOW_EMPTY_ROOT_PASSWORD=1 \
+      -e MARIADB_ROOT_HOST="localhost" \
+      -e MARIADB_AUTO_UPGRADE=1 \
+      -v /opt/mysql_data:/var/lib/mysql \
+      -v /opt/out_database/mysql:/opt/out_database/mysql \
+      -v /run/mysqld:/run/mysqld \
+      -v /opt/mysql_init:/docker-entrypoint-initdb.d \
+      mariadb:lts \
+      --character-set-server=utf8mb4 \
+      --collation-server=utf8mb4_unicode_ci \
+      --skip-name-resolve \
+      --innodb-buffer-pool-size=${CALCULATED_RAM}M \
+      --innodb-flush-method=O_DIRECT
+      
+      
+    unset countdown_confirm
+
+    echo -e "${YELLOW}等待資料庫初始化...${RESET}"
+    until docker exec "mariadb" "mariadb-admin" ping >/dev/null 2>&1; do
+      sleep 1
+    done
+
+    echo -e "\n${GREEN}資料庫已連線！補償緩衝中...${RESET}"
+    sleep 5
+    rm -rf /opt/mysql_init
+      
+    echo -e "${GREEN}MySQL安裝完成！${RESET}"
+    exec dba mysql
+    ;;
+  pgsql)
+    mkdir -p /opt/pgsql_init
+    echo "ALTER USER postgres WITH PASSWORD NULL;" > /opt/pgsql_init/01_init_auth.sql
+    docker run -d \
+      --name postgres \
+      --restart always \
+      -e TZ="$TIMEZONE" \
+      -e POSTGRES_USER=postgres \
+      -e POSTGRES_PASSWORD="temporary_security_bypass" \
+      -e POSTGRES_HOST_AUTH_METHOD=scram-sha-256 \
+      -e POSTGRES_INITDB_ARGS="--auth-local=trust" \
+      -p 5432:5432 \
+      -v /opt/pgsql_data:/var/lib/postgresql \
+      -v /opt/out_database/pgsql:/opt/out_database/pgsql \
+      -v /opt/pgsql_init:/docker-entrypoint-initdb.d \
+      postgres:latest
+    
+    unset countdown_confirm
+    
+    echo -ne "${YELLOW}等待 PostgreSQL 就緒...${RESET}"
+    until docker exec "postgres" pg_isready -U postgres >/dev/null 2>&1; do
+      sleep 1
+    done
+    echo -e "\n${GREEN}資料庫已連線！補償緩衝中...${RESET}"
+    sleep 5
+    rm -rf /opt/pgsql_init
+    
+    echo -e "${GREEN}PostgreSQL 已安裝完成。${RESET}" 
+    exec dba pgsql
     ;;
   esac
 }
@@ -1936,40 +2474,129 @@ update_script() {
 install_menu(){
   while true; do
     echo "=======資料庫管理工具========"
-    echo "1. 安裝MySQL"
-    echo "2. 安裝PostgreSQL"
+    echo "1. 安裝MySQL（MariaDB）【本地版】"
+    echo "2. 安裝MySQL（MariaDB）【Docker版】"
+    echo "3. 安裝PostgreSQL【本地版】"
+    echo "4. 安裝PostgreSQL【Docker版】"
+    echo -e "${YELLOW}兩者比較："
+    echo -e "1. 本地版的因為超級用戶是在localhost，所以可不設密碼，可以被防火牆控制，但缺點就是僅支援Debian/Ubuntu+RHEL系列系統"
+    echo -e "2. Docker版是超級用戶一定需要設置密碼，因為不在你本機而是在容器，它分不清楚，支援所有有docker的系統，而缺點就是如果你是firewalld和iptables可被控制，但ufw無法阻止外部人士訪問。"
+    echo -e "備註：如果您選擇本地的如果不支援也會跳至docker版的。且我安裝的Docker版是root無密碼的，而鎖定在內部的localhost，外部都是無法連結至root。${RESET}"
     read -p "請選擇安裝程式：" choice
     case $choice in
     1)
       install_database mysql
       ;;
     2)
+      docker_install_database mysql
+      ;;
+    3)
       install_database pgsql
+      ;;
+    4)
+      docker_install_database pgsql
       ;;
     esac
   done
 }
 
-choice_db_menu(){
+choice_db_menu() {
   while true; do
-    echo "=======資料庫管理工具========"
-    echo "1. 管理MySQL"
-    echo "2. 管理PostgreSQL"
-    read -p "請選擇安裝程式：" choice
-    case $choice in
-    1)
-      get_mysql_command
-      db_mode=mysql
-      show_menu
-      ;;
-    2)
-      get_postgres_command
-      db_mode=pgsql
-      show_menu
-      ;;
-    esac
+    local options=()
+    local actions=()
+    
+    echo -e "\n======= 偵測到以下資料庫環境 ======="
+
+    # 1. Docker MariaDB
+    for name in "${docker_names_mariadb[@]}"; do
+      options+=("管理 MariaDB (Docker 容器: $name)")
+      actions+=("D_MARIA|$name")
+    done
+
+    # 2. Docker MySQL
+    for name in "${docker_names_mysql[@]}"; do
+      options+=("管理 MySQL (Docker 容器: $name)")
+      actions+=("D_MY|$name")
+    done
+
+    # 3. Docker PostgreSQL
+    for name in "${docker_names_pgsql[@]}"; do
+      options+=("管理 PostgreSQL (Docker 容器: $name)")
+      actions+=("D_PG|$name")
+    done
+
+    # 4. 本機 MySQL / MariaDB（合併顯示）
+    [[ "$local_mysql" == true ]] && {
+      options+=("管理 MySQL/MariaDB (本機安裝)")
+      actions+=("L_MY")
+    }
+
+    # 5. 本機 PostgreSQL
+    [[ "$local_pg" == true ]] && {
+      options+=("管理 PostgreSQL (本機安裝)")
+      actions+=("L_PG")
+    }
+
+    # --- 顯示選單 ---
+    if [[ ${#options[@]} -eq 0 ]]; then
+      echo "未偵測到任何資料庫環境。"
+      return
+    fi
+
+    for i in "${!options[@]}"; do
+      echo "$((i+1)). ${options[$i]}"
+    done
+    echo "q. 退出"
+
+    read -p "請選擇要管理的環境: " choice
+    [[ "$choice" == "q" ]] && return
+
+    local idx=$((choice-1))
+    local action_data="${actions[$idx]}"
+
+    if [[ -n "$action_data" ]]; then
+      local act_type="${action_data%%|*}"
+      local target_name="${action_data#*|}"
+
+      case "$act_type" in
+        D_MARIA)
+          docker_name="$target_name"
+          db_mode="mysql"   # 👉 MariaDB 走 mysql 流程
+          get_mysql_command
+          show_menu
+          ;;
+        D_MY)
+          docker_name="$target_name"
+          db_mode="mysql"
+          get_mysql_command
+          show_menu
+          ;;
+        D_PG)
+          docker_name="$target_name"
+          db_mode="pgsql"
+          get_postgres_command
+          show_menu
+          ;;
+        L_MY)
+          docker_name=""
+          db_mode="mysql"
+          get_mysql_command
+          show_menu
+          ;;
+        L_PG)
+          docker_name=""
+          db_mode="pgsql"
+          get_postgres_command
+          show_menu
+          ;;
+      esac
+    else
+      echo "無效選擇。"
+    fi
   done
 }
+
+
 
 get_input_or_nav() {
   local input_buffer=""
@@ -2009,6 +2636,54 @@ get_input_or_nav() {
   done
   stty echo
 }
+install_db_and_switch() {
+  local db_mode="$1"
+  if [ $db_mode == mysql ]; then
+    db_mode=pgsql
+  elif [ $db_mode == pgsql ]; then
+    db_mode=mysql
+  fi
+  if [[ $db_mode == pgsql ]]; then
+    local pg_docker_count=${#docker_names_pgsql[@]}
+    
+    if [[ "$local_pgsql" == true ]] || [[ $pg_docker_count -eq 1 ]]; then
+      exec dba pgsql
+      return 0
+    elif { [[ "$local_pgsql" == true ]] && (( pg_docker_count >= 1 )); } || (( pg_docker_count > 1 )); then
+      choice_db_menu
+      return 0
+    fi
+  elif [[ $db_mode == mysql ]]; then
+    local mysql_docker_total=$(( ${#docker_names_mysql[@]} + ${#docker_names_mariadb[@]} ))
+    if [[ "$local_mysql" == true ]] || [[ $mysql_docker_total == 1 ]] ; then
+      exec dba mysql
+      return 0
+    elif { [[ "$local_mysql" == true ]] && (( mysql_docker_total >= 1 )); } || (( mysql_docker_total > 1 )); then
+      choice_db_menu
+      return 0
+    fi
+  fi
+  
+  local choice
+  echo "1. 安裝本地版"
+  echo '2. 安裝Docker版'
+  echo -e "${YELLOW}兩者比較："
+  echo -e "1. 本地版的因為超級用戶是在localhost，所以可不設密碼，可以被防火牆控制，但缺點就是僅支援Debian/Ubuntu+RHEL系列系統"
+  echo -e "2. Docker版是超級用戶一定需要設置密碼，因為不在你本機而是在容器，它分不清楚，支援所有有docker的系統，而缺點就是如果你是firewalld和iptables可被控制，但ufw無法阻止外部人士訪問。"
+  echo -e "備註：我安裝的Docker版是root無密碼的，而鎖定在內部的localhost，外部都是無法連結至root${RESET}"
+  read -p "請輸入您的選擇：" choice
+  case $choice in
+  1)
+    install_database $db_mode
+    ;;
+  2)
+    docker_install_database $db_mode
+    ;;
+  *)
+    return
+    ;;
+  esac
+}
 
 show_menu(){
   while true; do
@@ -2035,11 +2710,11 @@ show_menu(){
     echo -e "\033[1;34m--------------\033[0m"
     if [ $db_mode = mysql ]; then
       echo "10. 解除安裝MySQL"
-      echo "11. 安裝及管理PostgreSQL"
+      echo -e "11. 安裝或管理PostgreSQL${YELLOW}（若已安裝就會直接進入管理）${RESET}"
       echo "12. 安裝管理工具phpmyadmin（須有docker和超級用戶）"
     elif [ $db_mode = pgsql ]; then
       echo "10. 解除安裝PostgreSQL"
-      echo "11. 安裝及管理MySQL"
+      echo -e "11. 安裝及管理MySQL${YELLOW}（若已安裝就會直接進入管理）${RESET}"
       echo "12. 安裝管理工具pgweb（須有docker和超級用戶）"
     fi
     echo ""
@@ -2105,11 +2780,7 @@ show_menu(){
       uninstall_database $db_mode
       ;;
     11)
-      if [ $db_mode = mysql ]; then
-        install_database pgsql
-      elif [ $db_mode = pgsql ]; then
-        install_database mysql
-      fi
+      install_db_and_switch $db_mode
       ;;
     12)
       deploy_webui
