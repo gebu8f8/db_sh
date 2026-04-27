@@ -112,11 +112,15 @@ jobs:
             -H "Content-Type: application/json" \
             -d "$json_payload" > response.json
 
-          summary=$(jq -r '.choices[0].message.content // "AI 回傳空結果"' response.json)
+          summary=$(jq -r '.choices[0].message.content // "AI回傳空結果"' response.json)
 
-          echo "summary<<EOF" >> $GITHUB_ENV
-          echo "$summary" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
+          if [[ "$summary" == "AI回傳空結果" ]]; then
+            exit 0
+          else
+            echo "summary<<EOF" >> $GITHUB_ENV
+            echo "$summary" >> $GITHUB_ENV
+            echo "EOF" >> $GITHUB_ENV
+          fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
