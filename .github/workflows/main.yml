@@ -115,17 +115,18 @@ jobs:
           summary=$(jq -r '.choices[0].message.content // "AI回傳空結果"' response.json)
 
           if [[ "$summary" == "AI回傳空結果" ]]; then
-            exit 0
+            echo "SKIP_NEXT=true" >> $GITHUB_ENV
           else
-            echo "summary<<EOF" >> $GITHUB_ENV
-            echo "$summary" >> $GITHUB_ENV
-            echo "EOF" >> $GITHUB_ENV
+            echo "SKIP_NEXT=false" >> $GITHUB_ENV
           fi
+          echo "summary<<EOF" >> $GITHUB_ENV
+          echo "$summary" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Show Release Note
-        if: env.changed_ngsh == 'true' && env.skip_whole_workflow != 'true'
+        if: env.changed_ngsh == 'true' && env.skip_whole_workflow != 'true' && env.SKIP_NEXT != 'true'
         env:
           SUMMARY_CONTENT: ${{ env.summary }}
         run: |
@@ -133,13 +134,13 @@ jobs:
           echo "$SUMMARY_CONTENT"
 
       - name: Create git tag
-        if: env.changed_ngsh == 'true' && env.skip_whole_workflow != 'true' && env.skip_ai == 'false'
+        if: env.changed_ngsh == 'true' && env.skip_whole_workflow != 'true' && env.skip_ai == 'false' && env.SKIP_NEXT != 'true'
         run: |  
           git tag ${{ steps.read_version.outputs.version_final }}
           git push origin ${{ steps.read_version.outputs.version_final }}
   
       - name: Create GitHub Release
-        if: env.changed_ngsh == 'true' && env.skip_whole_workflow != 'true' && env.skip_ai == 'false'
+        if: env.changed_ngsh == 'true' && env.skip_whole_workflow != 'true' && env.skip_ai == 'false' && env.SKIP_NEXT != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.read_version.outputs.version_final }}
@@ -150,7 +151,7 @@ jobs:
 
       - name: Send Telegram Message
         continue-on-error: true
-        if: env.changed_ngsh == 'true' && env.skip_whole_workflow != 'true' && env.skip_ai == 'false'
+        if: env.changed_ngsh == 'true' && env.skip_whole_workflow != 'true' && env.skip_ai == 'false' && env.SKIP_NEXT != 'true'
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
