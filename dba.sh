@@ -8,7 +8,7 @@ CYAN='\033[0;36m'    # 一般提示用青色
 GRAY='\033[0;90m'
 RESET='\033[0m'      # 清除顏色
 
-version="5.0.0"
+version="5.0.1"
 cli_mode=false
 
 # 變亮
@@ -457,7 +457,7 @@ get_mysql_command() {
   [[ -n "$password" ]] && return 0
   local decrypt_tool="/etc/database"
   local mysql_root_pw=""
-  local pass_file="/etc/mysql_pss.conf"
+  local pass_file="/etc/'$docker_name'_pss.conf"
   # --- Docker 版本處理邏輯 ---
   if [[ -n "$docker_name" ]]; then
   
@@ -1674,7 +1674,7 @@ uninstall_database(){
   confirm=${confirm,,}
   confirm=${confirm:-y}
   if [[ -n "$docker_name" ]]; then
-  case $type in
+    case $type in
     mysql)
       local img_id
       local docker_data_paths=()
@@ -1713,23 +1713,23 @@ uninstall_database(){
         docker rmi "$img_id" || echo -e "${RED}鏡像正在被其他容器使用，跳過刪除。${RESET}"
       fi
       ;;
-  esac
+    esac
 
-  [[ $total_in_all -eq 1 ]] && rm -f /etc/databaserm /usr/local/bin/dba
-  rm -f /etc/"$type"-pss.conf
+    [[ $total_in_all -eq 1 ]] && rm -f /etc/databaserm /usr/local/bin/dba
+    rm -f /etc/"$docker_name"-pss.conf
 
-  if [[ $confirm == n ]]; then
-    for dir in "${docker_data_paths[@]}"; do
-      [[ -n "$dir" ]] && rm -rf -- "$dir"
-    done
-    rm -rf /opt/"$type"_data /opt/out_database/"$type"
-    echo -e "${GREEN}所有資料已清除完畢。${RESET}"
-    exit 0
+    if [[ $confirm == n ]]; then
+      for dir in "${docker_data_paths[@]}"; do
+        [[ -n "$dir" ]] && rm -rf -- "$dir"
+      done
+      rm -rf /opt/"$type"_data /opt/out_database/"$type"
+      echo -e "${GREEN}所有資料已清除完畢。${RESET}"
+      exit 0
+    else
+      echo -e "${GREEN}已清除容器本身，保留資料。${RESET}"
+      exit 0
+    fi
   fi
-
-  echo -e "${GREEN}已清除容器本身，保留資料。${RESET}"
-  exit 0
-fi
   case $type in
   mysql)
     if [ $system -eq 1 ]; then
@@ -2122,135 +2122,183 @@ docker_install_database() {
 
 
 show_postgres_info() {
-  local target_page="$1"
-  [ -z "$target_page" ] && target_page=1
+  local target_page="${1:-1}"
 
-  # 顏色定義
-  local BLUE='\033[0;34m'
+  local BLUE='\u001B[0;34m'
+  local GRAY='\u001B[0;90m'
+
+  _DW=0
+  _PADDED=""
 
   display_width() {
-    local str="$1"; local width=0; local i=0; local len=${#str}
-    # 移除顏色代碼後計算
-    local clean=$(echo -e "$str" | sed "s/\x1B\[[0-9;]*[a-zA-Z]//g")
-    len=${#clean}
-    while [ $i -lt $len ]; do
-      local char="${clean:$i:1}"
-      if [[ $(printf "%d" "'$char") -gt 127 ]] 2>/dev/null; then width=$((width + 2)); else width=$((width + 1)); fi
-      i=$((i + 1))
+    local str="$1" i ch ord
+    _DW=0
+    for ((i=0; i<${#str}; i++)); do
+      ch="${str:i:1}"
+      LC_CTYPE=C printf -v ord '%d' "'$ch" 2>/dev/null || ord=63
+      (( ord > 127 )) && ((_DW += 2)) || ((_DW += 1))
     done
-    echo $width
   }
-  
+
   pad_str() {
-    local text="$1"; local max="$2"; local align="$3"
-    local w; w=$(display_width "$text")
-    local pad=$((max - w)); [[ $pad -lt 0 ]] && pad=0
-    local spaces; printf -v spaces "%*s" $pad ""
-    if [[ "$align" == "right" ]]; then echo "${spaces}${text}"; else echo "${text}${spaces}"; fi
+    local text="$1" max="$2" align="$3" pad
+    display_width "$text"
+    pad=$((max - _DW))
+    (( pad < 0 )) && pad=0
+
+    if [[ "$align" == "right" ]]; then
+      printf -v _PADDED "%*s%s" "$pad" "" "$text"
+    else
+      printf -v _PADDED "%s%*s" "$text" "$pad" ""
+    fi
   }
 
-  echo -e "\n${CYAN}目 前 資 料 庫 與 用 戶 狀 態 ：${RESET}"
-
-  # --- 合併 SQL 查詢 (Type 1: DB Info, Type 2: All Users, Type 3: Orphans) ---
   local combined_sql="
-    -- 1. 資料庫資訊
     SELECT '1', d.datname, r.rolname || '|' || COALESCE((
-        SELECT string_agg(u.rolname, ', ') FROM pg_roles u 
-        WHERE has_database_privilege(u.rolname, d.datname, 'CONNECT')
-        AND u.rolname NOT LIKE 'pg_%' AND u.rolname != 'postgres' AND u.rolname != r.rolname
+      SELECT string_agg(u.rolname, ', ' ORDER BY u.rolname)
+      FROM pg_roles u
+      WHERE has_database_privilege(u.rolname, d.datname, 'CONNECT')
+        AND u.rolname NOT LIKE 'pg_%'
+        AND u.rolname <> 'postgres'
+        AND u.rolname <> r.rolname
     ), '無')
-    FROM pg_database d JOIN pg_roles r ON d.datdba = r.oid
-    WHERE d.datistemplate = false AND d.datname <> 'postgres'
+    FROM pg_database d
+    JOIN pg_roles r ON d.datdba = r.oid
+    WHERE d.datistemplate = false
+      AND d.datname <> 'postgres'
+
     UNION ALL
-    -- 2. 所有登入用戶
-    SELECT '2', rolname, '' FROM pg_roles 
-    WHERE rolcanlogin = true AND rolname NOT LIKE 'pg_%' AND rolname != 'postgres'
+
+    SELECT '2', d.datname, ''
+    FROM pg_database d
+    WHERE d.datistemplate = false
+      AND d.datname <> 'postgres'
+
     UNION ALL
-    -- 3. 孤立用戶
-    SELECT '3', r.rolname, '' FROM pg_roles r
-    WHERE r.rolcanlogin = true AND r.rolsuper = false AND r.rolname NOT LIKE 'pg_%' AND r.rolname != 'postgres'
-    AND NOT EXISTS (
-        SELECT 1 FROM pg_database d 
-        WHERE d.datistemplate = false AND d.datname <> 'postgres' 
-        AND has_database_privilege(r.rolname, d.datname, 'CONNECT')
-    );
+
+    SELECT '3', rolname, ''
+    FROM pg_roles
+    WHERE rolcanlogin = true
+      AND rolname NOT LIKE 'pg_%'
+      AND rolname <> 'postgres'
+
+    UNION ALL
+
+    SELECT '4', r.rolname, ''
+    FROM pg_roles r
+    WHERE r.rolcanlogin = true
+      AND r.rolname NOT LIKE 'pg_%'
+      AND r.rolname <> 'postgres'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM pg_database d
+        WHERE d.datistemplate = false
+          AND d.datname <> 'postgres'
+          AND has_database_privilege(r.rolname, d.datname, 'CONNECT')
+      )
   "
 
-  # 執行一次 psql 獲取所有數據
   local raw_output
   raw_output=$("${PSQL_CMD[@]}" -t -A -F'§' -c "$combined_sql" 2>/dev/null)
-  
-  local -a db_rows=()
-  local -a all_users=()
-  local -a orphan_users=()
 
+  local -a db_rows=()
+  local -a all_dbs=()
+  local -a all_roles=()
+  local -a orphan_roles=()
+
+  local type col1 col2
   while IFS='§' read -r type col1 col2; do
     case "$type" in
       1) db_rows+=("$col1|$col2") ;;
-      2) all_users+=("$col1") ;;
-      3) orphan_users+=("$col1") ;;
+      2) [[ -n "$col1" ]] && all_dbs+=("$col1") ;;
+      3) [[ -n "$col1" ]] && all_roles+=("$col1") ;;
+      4) [[ -n "$col1" ]] && orphan_roles+=("$col1") ;;
     esac
   done <<< "$raw_output"
 
-  # --- 分頁處理 ---
   local total_rows=${#db_rows[@]}
   local page_size=10
   TOTAL_PAGES_PG=$(( (total_rows + page_size - 1) / page_size ))
-  [[ $TOTAL_PAGES_PG -eq 0 ]] && TOTAL_PAGES_PG=1
-  
-  if [ "$target_page" -gt "$TOTAL_PAGES_PG" ]; then target_page=$TOTAL_PAGES_PG; fi
-  [ "$target_page" -lt 1 ] && target_page=1
+  (( TOTAL_PAGES_PG == 0 )) && TOTAL_PAGES_PG=1
+
+  (( target_page > TOTAL_PAGES_PG )) && target_page=$TOTAL_PAGES_PG
+  (( target_page < 1 )) && target_page=1
   CURRENT_PAGE_PG=$target_page
 
   local start=$(( (target_page - 1) * page_size ))
   local end=$(( start + page_size - 1 ))
-  [ $end -ge $total_rows ] && end=$(( total_rows - 1 ))
+  (( end >= total_rows )) && end=$(( total_rows - 1 ))
 
-  # --- 渲染當前頁面 ---
-  if [ $total_rows -eq 0 ]; then
-    echo -e "${YELLOW}  尚 無 自 訂 資 料 庫。${RESET}"
+  if (( total_rows == 0 )); then
+    echo -e "${GRAY}尚無自訂資料庫。${RESET}"
   else
-    local headers=("資 料 庫 名 稱" "擁 有 者" "其 他 可 存 取 用 戶")
+    local headers=("資料庫名稱" "擁有者" "其他可存取角色")
     local -a col_widths=(0 0 0)
-    for i in {0..2}; do col_widths[$i]=$(display_width "${headers[$i]}"); done
+    local i
+    for i in "${!headers[@]}"; do
+      display_width "${headers[$i]}"
+      col_widths[$i]=$_DW
+    done
 
     local -a page_data=()
+    local db owner other w1 w2 w3
     for ((i=start; i<=end; i++)); do
       IFS='|' read -r db owner other <<< "${db_rows[$i]}"
-      # 計算寬度 (純英文/數字可直接算，但在 Postgres 可能有其他字元)
-      [ $(display_width "$db") -gt ${col_widths[0]} ] && col_widths[0]=$(display_width "$db")
-      [ $(display_width "$owner") -gt ${col_widths[1]} ] && col_widths[1]=$(display_width "$owner")
-      [ $(display_width "$other") -gt ${col_widths[2]} ] && col_widths[2]=$(display_width "$other")
+
+      display_width "$db";    w1=$_DW
+      display_width "$owner"; w2=$_DW
+      display_width "$other"; w3=$_DW
+
+      (( w1 > col_widths[0] )) && col_widths[0]=$w1
+      (( w2 > col_widths[1] )) && col_widths[1]=$w2
+      (( w3 > col_widths[2] )) && col_widths[2]=$w3
+
       page_data+=("$db|$owner|$other")
     done
 
-    # 輸出表頭
     local h_line=""
-    h_line+=$(pad_str "${headers[0]}" "${col_widths[0]}" "left") && h_line+=" | "
-    h_line+=$(pad_str "${headers[1]}" "${col_widths[1]}" "left") && h_line+=" | "
-    h_line+=$(pad_str "${headers[2]}" "${col_widths[2]}" "left")
+    for i in "${!headers[@]}"; do
+      pad_str "${headers[$i]}" "${col_widths[$i]}" "left"
+      h_line+="$_PADDED"
+      (( i < 2 )) && h_line+=" | "
+    done
     echo -e "${BLUE}${h_line}${RESET}"
 
-    # 輸出內容
+    local row line
     for row in "${page_data[@]}"; do
-      IFS='|' read -r d o ot <<< "$row"
-      local line=""
-      line+=$(pad_str "$d" "${col_widths[0]}" "left") && line+=" | "
-      line+=$(pad_str "$o" "${col_widths[1]}" "left") && line+=" | "
-      line+=$(pad_str "$ot" "${col_widths[2]}" "left")
+      IFS='|' read -r db owner other <<< "$row"
+      line=""
+
+      pad_str "$db" "${col_widths[0]}" "left"
+      line+="$_PADDED | "
+
+      pad_str "$owner" "${col_widths[1]}" "left"
+      line+="$_PADDED | "
+
+      pad_str "$other" "${col_widths[2]}" "left"
+      line+="$_PADDED"
+
       echo -e "$line"
     done
+    if (( ${#all_dbs[@]} > 0 )); then
+      local db_list
+      db_list=$(IFS=', '; echo "${all_dbs[*]}")
+      echo -e "${BLUE}所有資料庫：${RESET}$db_list"
+    else
+      echo -e "${BLUE}所有資料庫：${RESET}無"
+    fi
+    if (( ${#all_roles[@]} > 0 )); then
+    echo -e "
+${BLUE}所有角色列表：${RESET}${all_roles[*]}"
+    fi
+
+    if (( ${#orphan_roles[@]} > 0 )); then
+      echo -e "${RED}孤立角色：${RESET}${orphan_roles[*]}"
+    fi
+
     echo -e "${GRAY}頁碼: $CURRENT_PAGE_PG / $TOTAL_PAGES_PG${RESET}"
   fi
 
-  # 底部資訊 (用戶列表)
-  if [ ${#all_users[@]} -gt 0 ]; then
-    echo -e "\n${CYAN}所 有 用 戶 列 表：${RESET} ${all_users[*]}"
-  fi
-
-  if [ ${#orphan_users[@]} -gt 0 ]; then
-    echo -e "${RED}警告：孤立用戶（無資料庫權限）：${RESET} ${orphan_users[*]}"
-  fi
 }
 setup_dba_command() {
   local dba_path="/usr/local/bin/dba"
@@ -2269,159 +2317,176 @@ setup_dba_command() {
 }
 
 show_mysql_info() {
-  local target_page="$1"
-  [ -z "$target_page" ] && target_page=1
+  local target_page="${1:-1}"
+  local SEP=$'\u001F'
 
-  # --- 顏色定義 ---
-  local BLUE='\033[0;34m'
-  local GRAY='\033[0;90m'
+  local BLUE='\u001B[0;34m'
+  local GRAY='\u001B[0;90m'
 
-  # --- 輔助函式：計算寬度 ---
+  _DW=0
+  _PADDED=""
+
   display_width() {
-    local str="$1"; local width=0; local i=0; local len=${#str}
-    while [ $i -lt $len ]; do
-      local char="${str:$i:1}"
-      if [[ $(printf "%d" "'$char") -gt 127 ]] 2>/dev/null; then width=$((width + 2)); else width=$((width + 1)); fi
-      i=$((i + 1))
+    local str="$1" i ch ord
+    _DW=0
+    for ((i=0; i<${#str}; i++)); do
+      ch="${str:i:1}"
+      LC_CTYPE=C printf -v ord '%d' "'$ch" 2>/dev/null || ord=63
+      (( ord > 127 )) && ((_DW += 2)) || ((_DW += 1))
     done
-    echo $width
   }
+
   pad_str() {
-    local text="$1"; local max="$2"; local align="$3"
-    local w; w=$(display_width "$text")
-    local pad=$((max - w)); [[ $pad -lt 0 ]] && pad=0
-    local spaces; printf -v spaces "%*s" $pad ""
-    if [[ "$align" == "right" ]]; then echo "${spaces}${text}"; else echo "${text}${spaces}"; fi
+    local text="$1" max="$2" align="$3" pad
+    display_width "$text"
+    pad=$((max - _DW))
+    (( pad < 0 )) && pad=0
+
+    if [[ "$align" == "right" ]]; then
+      printf -v _PADDED "%*s%s" "$pad" "" "$text"
+    else
+      printf -v _PADDED "%s%*s" "$text" "$pad" ""
+    fi
   }
 
-  echo -e "\n${CYAN}目 前 資 料 庫 與 用 戶 狀 態 ：${RESET}"
-
-  # --- 極速資料獲取 (一次 SQL 查詢搞定所有事) ---
-  # 我們用 UNION 來標記不同類型的數據，減少連線開銷
-  # 格式: TYPE | COL1 | COL2
-  # TYPE 1: DB List
-  # TYPE 2: DB Users Map
-  # TYPE 3: Orphan Users
-  
+  # 1) 主表格查詢：維持你現在這版，不碰
   local sql_query="
-    -- 1. 獲取所有自訂資料庫
-    SELECT '1', schema_name, '' 
-    FROM information_schema.schemata 
+    SELECT '1', schema_name, ''
+    FROM information_schema.schemata
     WHERE schema_name NOT IN ('mysql','information_schema','performance_schema','sys')
+
     UNION ALL
-    -- 2. 獲取資料庫授權用戶
-    SELECT '2', db, GROUP_CONCAT(DISTINCT user SEPARATOR ', ')
-    FROM mysql.db 
-    WHERE db NOT IN ('mysql','information_schema','performance_schema','sys') 
+
+    SELECT '2', db, GROUP_CONCAT(DISTINCT user ORDER BY user SEPARATOR ', ')
+    FROM mysql.db
+    WHERE db NOT IN ('mysql','information_schema','performance_schema','sys')
     GROUP BY db
-    UNION ALL
-    -- 3. 獲取孤立用戶 (複雜邏輯)
-    SELECT '3', CONCAT(user, '@', host), ''
-    FROM mysql.user AS u
-    WHERE user <> '' AND user NOT IN ('mysql.session','mysql.sys','debian-sys-maint','mysql','mariadb.sys','root')
-    AND CONCAT(user, '@', host) NOT IN (SELECT DISTINCT CONCAT(user, '@', host) FROM mysql.db)
-    AND NOT EXISTS (
-        SELECT 1 FROM mysql.user AS uu WHERE uu.user = u.user AND uu.host = u.host AND (
-          Select_priv='Y' OR Insert_priv='Y' OR Update_priv='Y' OR Delete_priv='Y' OR Create_priv='Y' OR Drop_priv='Y' OR
-          Reload_priv='Y' OR Shutdown_priv='Y' OR Process_priv='Y' OR File_priv='Y' OR Grant_priv='Y' OR References_priv='Y' OR
-          Index_priv='Y' OR Alter_priv='Y' OR Show_db_priv='Y' OR Super_priv='Y' OR Create_tmp_table_priv='Y' OR
-          Lock_tables_priv='Y' OR Create_view_priv='Y' OR Show_view_priv='Y' OR Create_routine_priv='Y' OR
-          Alter_routine_priv='Y' OR Execute_priv='Y' OR Event_priv='Y' OR Trigger_priv='Y'
-        )
-    );
   "
-  
-  # 執行 SQL 並讀取結果到記憶體
+
   local raw_output
-  raw_output=$("${MYSQL_CMD[@]}" -N -e "$sql_query")
-  
-  # 處理資料
+  raw_output=$("${MYSQL_CMD[@]}" -N -e "$sql_query" 2>/dev/null)
+
+  # 2) 獨立抓所有資料庫：只看非系統資料庫
+  local db_list_output
+  db_list_output=$("${MYSQL_CMD[@]}" -N -e "
+    SELECT schema_name
+    FROM information_schema.schemata
+    WHERE schema_name NOT IN ('mysql','information_schema','performance_schema','sys')
+    ORDER BY schema_name
+  " 2>/dev/null)
+
+  # 3) 獨立抓所有用戶：只看對非系統資料庫有授權的 user
+  local user_list_output
+  user_list_output=$("${MYSQL_CMD[@]}" -N -e "
+    SELECT DISTINCT user
+    FROM mysql.db
+    WHERE user <> ''
+      AND db NOT IN ('mysql','information_schema','performance_schema','sys')
+    ORDER BY user
+  " 2>/dev/null)
+
   local -a all_dbs=()
   declare -A db_users_map
-  local -a orphan_users=()
 
+  local type col1 col2
   while IFS=$'\t' read -r type col1 col2; do
-      case "$type" in
-          1) all_dbs+=("$col1") ;;
-          2) db_users_map["$col1"]="$col2" ;;
-          3) orphan_users+=("$col1") ;;
-      esac
+    case "$type" in
+      1) [[ -n "$col1" ]] && all_dbs+=("$col1") ;;
+      2) db_users_map["$col1"]="$col2" ;;
+    esac
   done <<< "$raw_output"
 
-  # --- 準備渲染資料 (合併 DB 與 User) ---
-  local -a render_rows=()
-  if [ ${#all_dbs[@]} -eq 0 ]; then
-      render_rows+=("無自訂資料庫|${YELLOW}尚無資料${RESET}")
-  else
-      for db in "${all_dbs[@]}"; do
-          local users="${db_users_map["$db"]}"
-          if [[ -z "$users" || "$users" == "NULL" ]]; then
-              render_rows+=("$db|${RED}無任何授權 (孤立資料庫)${RESET}")
-          else
-              render_rows+=("$db|$users")
-          fi
-      done
+  # 4) 轉成摘要列
+  local all_dbs_line="無"
+  if [[ -n "$db_list_output" ]]; then
+    all_dbs_line=$(paste -sd ', ' <<< "$db_list_output")
   fi
 
-  # --- 分頁計算 ---
+  local all_users_line="無"
+  if [[ -n "$user_list_output" ]]; then
+    all_users_line=$(paste -sd ', ' <<< "$user_list_output")
+  fi
+
+  local -a render_rows=()
+  local db users
+  if (( ${#all_dbs[@]} == 0 )); then
+    render_rows+=("無自訂資料庫${SEP}${YELLOW}尚無資料${RESET}${SEP}尚無資料")
+  else
+    for db in "${all_dbs[@]}"; do
+      users="${db_users_map[$db]}"
+      if [[ -z "$users" || "$users" == "NULL" ]]; then
+        render_rows+=("$db${SEP}${RED}無任何授權${RESET}${SEP}無任何授權")
+      else
+        render_rows+=("$db${SEP}$users${SEP}$users")
+      fi
+    done
+  fi
+
+  # 5) 先輸出摘要，再輸出表格
+  echo -e "${BLUE}所有資料庫：${RESET}${all_dbs_line}"
+  echo -e "${BLUE}所有用戶：${RESET}${all_users_line}"
+
   local total_rows=${#render_rows[@]}
   local page_size=10
   TOTAL_PAGES_MYSQL=$(( (total_rows + page_size - 1) / page_size ))
-  [[ $TOTAL_PAGES_MYSQL -eq 0 ]] && TOTAL_PAGES_MYSQL=1
-  
-  if [ "$target_page" -gt "$TOTAL_PAGES_MYSQL" ]; then target_page=$TOTAL_PAGES_MYSQL; fi
-  if [ "$target_page" -lt 1 ]; then target_page=1; fi
+  (( TOTAL_PAGES_MYSQL == 0 )) && TOTAL_PAGES_MYSQL=1
+
+  (( target_page > TOTAL_PAGES_MYSQL )) && target_page=$TOTAL_PAGES_MYSQL
+  (( target_page < 1 )) && target_page=1
   CURRENT_PAGE_MYSQL=$target_page
 
   local start_index=$(( (target_page - 1) * page_size ))
   local end_index=$(( start_index + page_size - 1 ))
-  if [ $end_index -ge $total_rows ]; then end_index=$(( total_rows - 1 )); fi
+  (( end_index >= total_rows )) && end_index=$(( total_rows - 1 ))
 
-  # --- 渲染表格 ---
-  local headers=("資 料 庫 名 稱" "可 存 取 用 戶")
+  local headers=("資料庫名稱" "可存取帳號")
   local -a col_widths=(0 0)
-  for i in "${!headers[@]}"; do col_widths[$i]=$(display_width "${headers[$i]}"); done
+  local i
+  for i in "${!headers[@]}"; do
+    display_width "${headers[$i]}"
+    col_widths[$i]=$_DW
+  done
 
   local -a page_data=()
+  local row db_name user_text user_clean w_db w_user
   for ((i=start_index; i<=end_index; i++)); do
-      IFS='|' read -r db u <<< "${render_rows[$i]}"
-      # 計算寬度
-      local clean_u=$(echo -e "$u" | sed "s/\x1B\[[0-9;]*[a-zA-Z]//g")
-      local w_db=$(display_width "$db")
-      local w_u=$(display_width "$clean_u")
-      
-      [ $w_db -gt ${col_widths[0]} ] && col_widths[0]=$w_db
-      [ $w_u -gt ${col_widths[1]} ] && col_widths[1]=$w_u
-      
-      page_data+=("$db|$u")
+    IFS="$SEP" read -r db_name user_text user_clean <<< "${render_rows[$i]}"
+
+    display_width "$db_name";   w_db=$_DW
+    display_width "$user_clean"; w_user=$_DW
+
+    (( w_db   > col_widths[0] )) && col_widths[0]=$w_db
+    (( w_user > col_widths[1] )) && col_widths[1]=$w_user
+
+    page_data+=("$db_name${SEP}$user_text${SEP}$user_clean")
   done
 
-  # 輸出 Header
   local header_line=""
-  header_line+=$(pad_str "${headers[0]}" "${col_widths[0]}" "left") && header_line+=" | "
-  header_line+=$(pad_str "${headers[1]}" "${col_widths[1]}" "left")
-  echo -e "${BLUE}${header_line}${RESET}"
-  
-  # 輸出 Body
-  for row in "${page_data[@]}"; do
-      IFS='|' read -r db u <<< "$row"
-      local line=""
-      line+=$(pad_str "$db" "${col_widths[0]}" "left") && line+=" | "
-      
-      local clean_u=$(echo -e "$u" | sed "s/\x1B\[[0-9;]*[a-zA-Z]//g")
-      local pad_len=$(( ${col_widths[1]} - $(display_width "$clean_u") ))
-      line+="$u"; printf -v sp "%*s" $pad_len ""; line+="$sp"
-      echo -e "$line"
+  for i in "${!headers[@]}"; do
+    pad_str "${headers[$i]}" "${col_widths[$i]}" "left"
+    header_line+="$_PADDED"
+    (( i < 1 )) && header_line+=" | "
   done
-  echo -e "${GRAY}頁碼: $CURRENT_PAGE_MYSQL / $TOTAL_PAGES_MYSQL${RESET}"
+  echo -e "${BLUE}${header_line}${RESET}"
 
-  # --- 顯示孤立用戶 (放在表格下方) ---
-  if [ ${#orphan_users[@]} -gt 0 ]; then
-      echo -e "\n${RED}警告：孤立用戶（沒有任何資料庫授權）：${RESET}"
-      # 簡單列出，用逗號分隔
-      local orphan_str=$(IFS=, ; echo "${orphan_users[*]}")
-      echo -e "${orphan_str//,/ }"
-  fi
+  local line pad_len sp
+  for row in "${page_data[@]}"; do
+    IFS="$SEP" read -r db_name user_text user_clean <<< "$row"
+    line=""
+
+    pad_str "$db_name" "${col_widths[0]}" "left"
+    line+="$_PADDED | "
+
+    display_width "$user_clean"
+    pad_len=$(( col_widths[1] - _DW ))
+    (( pad_len < 0 )) && pad_len=0
+    printf -v sp '%*s' "$pad_len" ''
+    line+="$user_text$sp"
+
+    echo -e "$line"
+  done
+
+  echo -e "${GRAY}頁碼: $CURRENT_PAGE_MYSQL / $TOTAL_PAGES_MYSQL${RESET}"
 }
 
 update_script() {
@@ -2721,7 +2786,7 @@ show_menu(){
     echo -e "\033[1;31mu. 更新腳本          0. 退出\033[0m"
     echo ""
     echo -e "${GRAY}[←/→] 翻頁  [數字] 選擇選單${RESET}"
-    echo -n -e "\033[1;33m請選擇操作 [0-11]: \033[0m"
+    echo -n -e "\033[1;33m請選擇操作 [0-12]: \033[0m"
     choice=$(get_input_or_nav)
     if [ $db_mode = mysql ]; then
       if [[ "$choice" == "NAV_NEXT" ]]; then
